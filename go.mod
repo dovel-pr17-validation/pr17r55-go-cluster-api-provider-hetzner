@@ -4,7 +4,7 @@ go 1.25.12
 
 require (
 	github.com/blang/semver/v4 v4.0.0
-	github.com/bramvdbogaerde/go-scp v1.5.0
+	github.com/bramvdbogaerde/go-scp v1.6.1
 	github.com/go-logr/logr v1.4.4
 	github.com/go-logr/zapr v1.3.0
 	github.com/google/go-cmp v0.7.0
