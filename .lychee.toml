@@ -1,0 +1,94 @@
+###
+### Display
+###
+
+# Show progress
+no_progress = true
+
+
+###
+### Runtime
+###
+# Number of threads to utilize.
+# Defaults to number of cores available to the system if omitted.
+#threads = 2
+
+# Maximum number of allowed redirects
+max_redirects = 10
+
+# Do not cache common rate-limit responses
+cache_exclude_status = "403, 429, 503"
+
+# Keep cached responses longer than the default 1d. Our CI cache is often
+# slightly older than 24h, which otherwise forces a full re-check and makes
+# transient upstream outages fail the build.
+max_cache_age = "7d"
+
+
+###
+### Requests
+###
+# User agent to send with each request
+user_agent = "curl/7.71.1"
+
+# Website timeout from connect to response finished. The previous 9s setting
+# was more aggressive than lychee's default and caused flaky failures for slow
+# but healthy upstream sites such as kubernetes.io.
+timeout = 20
+
+# Comma-separated list of accepted status codes for valid links.
+# Omit to accept all response types.
+#accept = "text/html"
+
+# Proceed for server connections considered insecure (invalid TLS)
+insecure = true
+
+# Only test links with the given scheme (e.g. https)
+# Omit to check links with any scheme
+#scheme = "https"
+
+# Request method
+method = "get"
+
+# Custom request headers
+header = {}
+
+
+###
+### Exclusions
+###
+# Exclude URLs from checking (supports regex)
+exclude = [
+    # "github", todo github token
+    "localhost",
+    "example.com",
+    "cluster-api-provider-hetzner.git",
+    "https://hetzner.cloud/",
+    "mailto:info@syself.com",
+    "https://www.hetzner.com/*",
+    "https://opensource.org/license/apache-2-0/",
+    "https://robot.your-server.de/*",
+    "https://www.linkedin.com/company/syself/",
+    "https://syself.com/",
+    "https://syself.com/demo ",
+]
+
+include = []
+
+# Exclude all private IPs from checking
+# Equivalent to setting `exclude_private`, `exclude_link_local`, and `exclude_loopback` to true
+exclude_all_private = false
+
+# Exclude private IP address ranges from checking
+exclude_private = false
+
+# Exclude link-local IP address range from checking
+exclude_link_local = false
+
+# Exclude loopback IP address range from checking
+exclude_loopback = true
+
+# Avoid https://docs.hetzner.com/... | Failed: Network error: Connection reset by peer (os error 104)
+max_concurrency = 1
+max_retries = 4
+retry_wait_time = 3

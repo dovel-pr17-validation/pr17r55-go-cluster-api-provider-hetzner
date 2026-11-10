@@ -1,0 +1,304 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	"github.com/hetznercloud/hcloud-go/v2/hcloud/schema"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/record"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	infrav1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta2"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/scope"
+	sshmock "github.com/syself/cluster-api-provider-hetzner/pkg/services/baremetal/client/mocks/ssh"
+	hcloudclient "github.com/syself/cluster-api-provider-hetzner/pkg/services/hcloud/client"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/services/hcloud/mockedsshclient"
+	"github.com/syself/cluster-api-provider-hetzner/test/helpers"
+)
+
+const serverJSON = `
+{
+	"backup_window": "22-02",
+	"created": "2016-01-30T23:55:00+00:00",
+	"datacenter": {
+		"description": "Falkenstein DC Park 8",
+		"id": 42,
+		"location": {
+			"city": "Falkenstein",
+			"country": "DE",
+			"description": "Falkenstein DC Park 1",
+			"id": 1,
+			"latitude": 50.47612,
+			"longitude": 12.370071,
+			"name": "fsn1",
+			"network_zone": "eu-central"
+		},
+		"name": "fsn1-dc8",
+		"server_types": {
+			"available": [
+				1,
+				2,
+				3
+			],
+			"available_for_migration": [
+				1,
+				2,
+				3
+			],
+			"supported": [
+				1,
+				2,
+				3
+			]
+		}
+	},
+	"id": 42,
+	"image": {
+		"bound_to": null,
+		"build_id": "c313fe40383af26094a5a92026054320ab55abc7",
+		"created": "2016-01-30T23:55:00+00:00",
+		"created_from": {
+			"id": 1,
+			"name": "Server"
+		},
+		"deleted": null,
+		"deprecated": "2018-02-28T00:00:00+00:00",
+		"description": "Ubuntu 24.04 Standard 64 bit",
+		"disk_size": 10,
+		"id": 42,
+		"image_size": 2.3,
+		"labels": {},
+		"name": "ubuntu-24.04",
+		"os_flavor": "ubuntu",
+		"os_version": "24.04",
+		"protection": {
+			"delete": false
+		},
+		"rapid_deploy": false,
+		"status": "available",
+		"type": "snapshot"
+	},
+	"included_traffic": 654321,
+	"ingoing_traffic": 123456,
+	"iso": {
+		"deprecated": "2018-02-28T00:00:00+00:00",
+		"description": "FreeBSD 11.0 x64",
+		"id": 42,
+		"name": "FreeBSD-11.0-RELEASE-amd64-dvd1",
+		"type": "public"
+	},
+	"labels": {},
+	"load_balancers": [],
+	"locked": false,
+	"name": "my-resource",
+	"outgoing_traffic": 123456,
+	"placement_group": {
+		"created": "2016-01-30T23:55:00+00:00",
+		"id": 42,
+		"labels": {},
+		"name": "my-resource",
+		"servers": [
+			42
+		],
+		"type": "spread"
+	},
+	"primary_disk_size": 50,
+	"private_net": [
+		{
+			"alias_ips": [],
+			"ip": "10.0.0.2",
+			"mac_address": "86:00:ff:2a:7d:e1",
+			"network": 4711
+		}
+	],
+	"protection": {
+		"delete": false,
+		"rebuild": false
+	},
+	"public_net": {
+		"firewalls": [
+			{
+				"id": 42,
+				"status": "applied"
+			}
+		],
+		"floating_ips": [
+			478
+		],
+		"ipv4": {
+			"blocked": false,
+			"dns_ptr": "server01.example.com",
+			"id": 42,
+			"ip": "1.2.3.4"
+		},
+		"ipv6": {
+			"blocked": false,
+			"dns_ptr": [
+				{
+					"dns_ptr": "server.example.com",
+					"ip": "2001:db8::1"
+				}
+			],
+			"id": 42,
+			"ip": "2001:db8::/64"
+		}
+	},
+	"rescue_enabled": false,
+	"server_type": {
+		"cores": 1,
+		"cpu_type": "shared",
+		"deprecated": false,
+		"description": "CX11",
+		"disk": 25,
+		"id": 1,
+		"memory": 1,
+		"name": "cx11",
+		"prices": [
+			{
+				"location": "fsn1",
+				"price_hourly": {
+					"gross": "1.1900000000000000",
+					"net": "1.0000000000"
+				},
+				"price_monthly": {
+					"gross": "1.1900000000000000",
+					"net": "1.0000000000"
+				}
+			}
+		],
+		"storage_type": "local"
+	},
+	"status": "running",
+	"volumes": []
+}`
+
+var (
+	testEnv *helpers.TestEnvironment
+	ctx     = ctrl.SetupSignalHandler()
+)
+
+func TestServer(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "Server Suite")
+}
+
+type Resetter struct{}
+
+var _ helpers.Resetter = &Resetter{}
+
+var hcloudCustomProvisionerTempDir string
+
+func (r *Resetter) ResetAndInitNamespace(_ string, testEnv *helpers.TestEnvironment, t FullGinkgoTInterface) func() {
+	rescueSSHClient := &sshmock.Client{}
+	// Register Testify helpers so failed expectations are reported against this test instance.
+
+	rescueSSHClient.Test(t)
+	testEnv.RescueSSHClient = rescueSSHClient
+
+	testEnv.HCloudSSHClient = &sshmock.Client{}
+	testEnv.HCloudSSHClient.Test(t)
+	testEnv.HCloudSSHClientFactory = mockedsshclient.NewSSHFactory(testEnv.HCloudSSHClient)
+	return func() {}
+}
+
+var _ = BeforeSuite(func() {
+	tmpDir, err := os.MkdirTemp("", "caph-hcloud-custom-provisioner-*")
+	Expect(err).NotTo(HaveOccurred())
+	hcloudCustomProvisionerTempDir = tmpDir
+	hcloudCustomProvisionerDir = tmpDir
+	commandPath := filepath.Join(hcloudCustomProvisionerDir, "custom-provisioner-test.sh")
+	err = os.WriteFile(commandPath, []byte("#!/bin/sh\nexit 0\n"), 0o600)
+	Expect(err).NotTo(HaveOccurred())
+
+	testEnv = helpers.NewTestEnvironment()
+	testEnv.Resetter = &Resetter{}
+	go func() {
+		defer GinkgoRecover()
+		Expect(testEnv.StartManager(ctx)).To(Succeed())
+	}()
+
+	<-testEnv.Elected()
+
+	// wait for webhook port to be open prior to running tests
+	testEnv.WaitForWebhooks()
+})
+
+var _ = AfterSuite(func() {
+	if hcloudCustomProvisionerTempDir != "" {
+		Expect(os.RemoveAll(hcloudCustomProvisionerTempDir)).To(Succeed())
+	}
+	Expect(testEnv.Stop()).To(Succeed())
+})
+
+func newTestServer() *hcloud.Server {
+	var serverSchema schema.Server
+	b := []byte(serverJSON)
+	var buffer bytes.Buffer
+	err := json.Compact(&buffer, b)
+	if err != nil {
+		panic(err)
+	}
+	err = json.Unmarshal(buffer.Bytes(), &serverSchema)
+	if err != nil {
+		panic(err)
+	}
+	return hcloud.ServerFromSchema(serverSchema)
+}
+
+func newTestService(hcloudMachine *infrav1.HCloudMachine, hcloudClient hcloudclient.Client) *Service {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(infrav1.AddToScheme(scheme))
+	utilruntime.Must(clusterv1.AddToScheme(scheme))
+	client := fakeclient.NewClientBuilder().WithScheme(scheme).Build()
+	machine := &clusterv1.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hcloudMachine.Name,
+			Namespace: hcloudMachine.Namespace,
+		},
+		Spec:   clusterv1.MachineSpec{},
+		Status: clusterv1.MachineStatus{},
+	}
+	err := client.Create(context.Background(), machine)
+	if err != nil {
+		panic(err)
+	}
+	return &Service{
+		&scope.MachineScope{
+			HCloudMachine:  hcloudMachine,
+			HCloudClient:   hcloudClient,
+			Client:         client,
+			Cluster:        &clusterv1.Cluster{},
+			HetznerCluster: &infrav1.HetznerCluster{},
+			Machine:        machine,
+			EventRecorder:  record.NewFakeRecorder(10),
+		},
+	}
+}

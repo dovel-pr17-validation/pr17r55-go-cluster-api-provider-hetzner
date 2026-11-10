@@ -1,0 +1,499 @@
+/*
+Copyright 2023 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/mock"
+	"github.com/syself/hrobot-go/models"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	conditions "sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	infrav1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta2"
+	robotmock "github.com/syself/cluster-api-provider-hetzner/pkg/services/baremetal/client/mocks/robot"
+	sshmock "github.com/syself/cluster-api-provider-hetzner/pkg/services/baremetal/client/mocks/ssh"
+	sshclient "github.com/syself/cluster-api-provider-hetzner/pkg/services/baremetal/client/ssh"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/utils"
+	"github.com/syself/cluster-api-provider-hetzner/test/helpers"
+)
+
+var _ = Describe("HetznerBareMetalRemediationReconciler", func() {
+	var (
+		host                        *infrav1.HetznerBareMetalHost
+		hetznerBareMetalRemediation *infrav1.HetznerBareMetalRemediation
+		hetznerBaremetalMachine     *infrav1.HetznerBareMetalMachine
+		machineName                 string
+		hetznerCluster              *infrav1.HetznerCluster
+
+		capiMachine *clusterv1.Machine
+		capiCluster *clusterv1.Cluster
+
+		hetznerSecret   *corev1.Secret
+		rescueSSHSecret *corev1.Secret
+		osSSHSecret     *corev1.Secret
+		bootstrapSecret *corev1.Secret
+
+		testNs *corev1.Namespace
+
+		hetznerBaremetalRemediationkey client.ObjectKey
+		hostKey                        client.ObjectKey
+		capiMachineKey                 client.ObjectKey
+
+		robotClient                  *robotmock.Client
+		rescueSSHClient              *sshmock.Client
+		osSSHClientAfterInstallImage *sshmock.Client
+		osSSHClientAfterCloudInit    *sshmock.Client
+	)
+
+	BeforeEach(func() {
+		var err error
+		var finish func()
+		testNs, finish, err = testEnv.ResetAndCreateNamespace(ctx, "hcloudmachinetemplate-reconciler")
+		defer finish()
+		Expect(err).NotTo(HaveOccurred())
+
+		machineName = utils.GenerateName(nil, "machine")
+
+		capiCluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "test1-",
+				Namespace:    testNs.Name,
+				Finalizers:   []string{clusterv1.ClusterFinalizer},
+			},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: "infrastructure.cluster.x-k8s.io",
+					Kind:     "HetznerCluster",
+					Name:     "hetzner-test1",
+				},
+			},
+		}
+		Expect(testEnv.Create(ctx, capiCluster)).To(Succeed())
+
+		capiMachine = &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       machineName,
+				Namespace:  testNs.Name,
+				Finalizers: []string{clusterv1.MachineFinalizer},
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel: capiCluster.Name,
+				},
+			},
+			Spec: clusterv1.MachineSpec{
+				ClusterName: capiCluster.Name,
+				InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: "infrastructure.cluster.x-k8s.io",
+					Kind:     "HetznerBareMetalMachine",
+					Name:     machineName,
+				},
+				FailureDomain: defaultFailureDomain,
+				Bootstrap: clusterv1.Bootstrap{
+					DataSecretName: ptr.To("bootstrap-secret"),
+				},
+			},
+		}
+		Expect(testEnv.Create(ctx, capiMachine)).To(Succeed())
+
+		capiMachineKey = client.ObjectKey{Name: machineName, Namespace: testNs.Name}
+
+		hetznerCluster = &infrav1.HetznerCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hetzner-test1",
+				Namespace: testNs.Name,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "Cluster",
+						Name:       capiCluster.Name,
+						UID:        capiCluster.UID,
+					},
+				},
+				Labels: map[string]string{clusterv1.ClusterNameLabel: capiCluster.Name},
+			},
+			Spec: getDefaultHetznerClusterSpec(),
+		}
+		Expect(testEnv.Create(ctx, hetznerCluster)).To(Succeed())
+
+		hetznerBaremetalMachine = &infrav1.HetznerBareMetalMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      machineName,
+				Namespace: testNs.Name,
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel:             capiCluster.Name,
+					clusterv1.MachineControlPlaneNameLabel: "",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "Machine",
+						Name:       capiMachine.Name,
+						UID:        capiMachine.UID,
+					},
+				},
+			},
+			Spec: getDefaultHetznerBareMetalMachineSpec(),
+		}
+
+		hetznerBareMetalRemediation = &infrav1.HetznerBareMetalRemediation{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hetzner-baremetal-remediation",
+				Namespace: testNs.Name,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Kind:       "Machine",
+						APIVersion: clusterv1.GroupVersion.String(),
+						Name:       capiMachine.Name,
+						UID:        capiMachine.UID,
+					},
+				},
+			},
+			Spec: infrav1.HetznerBareMetalRemediationSpec{
+				Strategy: infrav1.BareMetalRemediationStrategy{
+					RemediationStrategy: infrav1.RemediationStrategy{
+						Type:           "Reboot",
+						RetryLimit:     ptr.To(int32(1)),
+						TimeoutSeconds: ptr.To(int32(1)),
+					},
+				},
+			},
+		}
+
+		hetznerBaremetalRemediationkey = client.ObjectKey{Namespace: testNs.Name, Name: "hetzner-baremetal-remediation"}
+
+		robotClient = testEnv.RobotClient
+		rescueSSHClient = testEnv.RescueSSHClient
+		osSSHClientAfterInstallImage = testEnv.OSSSHClientAfterInstallImage
+		osSSHClientAfterCloudInit = testEnv.OSSSHClientAfterCloudInit
+
+		robotClient.On("GetBMServer", mock.Anything).Return(&models.Server{
+			ServerNumber: 1,
+			ServerIP:     "1.2.3.4",
+			Rescue:       true,
+		}, nil)
+		robotClient.On("ListSSHKeys").Return([]models.Key{
+			{
+				Name:        "my-name",
+				Fingerprint: "my-fingerprint",
+				Data:        "my-public-key",
+			},
+		}, nil)
+		robotClient.On("GetReboot", mock.Anything).Return(&models.Reset{Type: []string{"hw", "sw"}}, nil)
+		robotClient.On("GetBootRescue", 1).Return(&models.Rescue{Active: true}, nil)
+		robotClient.On("SetBootRescue", mock.Anything, mock.Anything).Return(&models.Rescue{Active: true}, nil)
+		robotClient.On("DeleteBootRescue", mock.Anything).Return(&models.Rescue{Active: false}, nil)
+		robotClient.On("RebootBMServer", mock.Anything, mock.Anything).Return(&models.ResetPost{}, nil)
+		robotClient.On("SetBMServerName", mock.Anything, mock.Anything).Return(nil, nil)
+
+		configureRescueSSHClient(rescueSSHClient)
+
+		osSSHClientAfterInstallImage.On("Reboot", mock.Anything).Return(sshclient.Output{})
+		osSSHClientAfterInstallImage.On("CloudInitStatus", mock.Anything).Return(sshclient.Output{StdOut: "status: done"})
+		osSSHClientAfterInstallImage.On("CheckCloudInitLogsForSigTerm", mock.Anything).Return(sshclient.Output{})
+		osSSHClientAfterInstallImage.On("ResetKubeadm", mock.Anything).Return(sshclient.Output{})
+		osSSHClientAfterInstallImage.On("GetCloudInitOutput", mock.Anything).Return(sshclient.Output{StdOut: "dummy content of /var/log/cloud-init-output.log"})
+		osSSHClientAfterInstallImage.On("GetHostName", mock.Anything).Return(sshclient.Output{
+			StdOut: infrav1.BareMetalHostNamePrefix + machineName,
+			StdErr: "",
+			Err:    nil,
+		})
+		osSSHClientAfterCloudInit.On("Reboot", mock.Anything).Return(sshclient.Output{})
+		osSSHClientAfterCloudInit.On("GetHostName", mock.Anything).Return(sshclient.Output{
+			StdOut: infrav1.BareMetalHostNamePrefix + machineName,
+			StdErr: "",
+			Err:    nil,
+		})
+		osSSHClientAfterCloudInit.On("CloudInitStatus", mock.Anything).Return(sshclient.Output{StdOut: "status: done"})
+		osSSHClientAfterCloudInit.On("CheckCloudInitLogsForSigTerm", mock.Anything).Return(sshclient.Output{})
+		osSSHClientAfterCloudInit.On("ResetKubeadm", mock.Anything).Return(sshclient.Output{})
+		osSSHClientAfterCloudInit.On("GetCloudInitOutput", mock.Anything).Return(sshclient.Output{StdOut: "dummy content of /var/log/cloud-init-output.log"})
+	})
+
+	AfterEach(func() {
+		Expect(testEnv.Cleanup(ctx, testNs, capiCluster, capiMachine, hetznerCluster)).To(Succeed())
+	})
+
+	Context("Basic hetznerbaremetalremediation test", func() {
+		Context("HetznerBareMetalHost will get provisioned", func() {
+			BeforeEach(func() {
+				hetznerSecret = getDefaultHetznerSecret(testNs.Name)
+				Expect(testEnv.Create(ctx, hetznerSecret)).To(Succeed())
+
+				rescueSSHSecret = helpers.GetDefaultSSHSecret("rescue-ssh-secret", testNs.Name)
+				Expect(testEnv.Create(ctx, rescueSSHSecret)).To(Succeed())
+
+				osSSHSecret = helpers.GetDefaultSSHSecret("os-ssh-secret", testNs.Name)
+				Expect(testEnv.Create(ctx, osSSHSecret)).To(Succeed())
+
+				bootstrapSecret = getDefaultBootstrapSecret(testNs.Name)
+				Expect(testEnv.Create(ctx, bootstrapSecret)).To(Succeed())
+			})
+
+			AfterEach(func() {
+				Expect(testEnv.Cleanup(ctx, testNs, hetznerSecret, osSSHSecret, rescueSSHSecret, bootstrapSecret)).To(Succeed())
+			})
+
+			Context("HetznerBareMetalHost doesn't exist", func() {
+				AfterEach(func() {
+					Expect(testEnv.Cleanup(ctx, hetznerBareMetalRemediation, hetznerBaremetalMachine)).To(Succeed())
+				})
+
+				It("should not remediate if no annotations is present in the hetznerBaremetalMachine", func() {
+					Expect(testEnv.Create(ctx, hetznerBaremetalMachine)).To(Succeed())
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					Eventually(func() bool {
+						if err := testEnv.Get(ctx, capiMachineKey, capiMachine); err != nil {
+							return false
+						}
+
+						return isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) &&
+							isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason)
+					}, timeout).Should(BeTrue())
+				})
+
+				It("should not remediate if HetznerBareMetalHost does not exist anymore", func() {
+					hetznerBaremetalMachine.Annotations = map[string]string{
+						infrav1.HostAnnotation: fmt.Sprintf("%s/%s", testNs.Name, hostName),
+					}
+					Expect(testEnv.Create(ctx, hetznerBaremetalMachine)).To(Succeed())
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					Eventually(func() bool {
+						if err := testEnv.Get(ctx, capiMachineKey, capiMachine); err != nil {
+							return false
+						}
+
+						return isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) &&
+							isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason)
+					}, timeout).Should(BeTrue())
+				})
+			})
+
+			Context("HetznerBareMetalHost exist", func() {
+				BeforeEach(func() {
+					hostKey = client.ObjectKey{Name: hostName, Namespace: testNs.Name}
+
+					By("creating HetznerBareMetalHost")
+					host = helpers.BareMetalHost(
+						hostName,
+						testNs.Name,
+						helpers.WithRootDeviceHintWWN(),
+					)
+					Expect(testEnv.Create(ctx, host)).To(Succeed())
+
+					By("creating hetznerBaremetalMachine")
+					hetznerBaremetalMachine.Annotations = map[string]string{
+						infrav1.HostAnnotation: fmt.Sprintf("%s/%s", testNs.Name, hostName),
+					}
+					Expect(testEnv.Create(ctx, hetznerBaremetalMachine)).To(Succeed())
+
+					By("ensuring host is provisioned")
+					Eventually(func() bool {
+						if err := testEnv.Get(ctx, hostKey, host); err != nil {
+							return false
+						}
+
+						return host.Status.ProvisioningState == infrav1.StateProvisioned
+					}, timeout).Should(BeTrue())
+				})
+
+				AfterEach(func() {
+					Expect(testEnv.Cleanup(ctx, host, hetznerBareMetalRemediation, hetznerBaremetalMachine)).To(Succeed())
+				})
+
+				It("should create hetznerBareMetalRemediation object successfully", func() {
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					Eventually(func() error {
+						return testEnv.Get(ctx, hetznerBaremetalRemediationkey, hetznerBareMetalRemediation)
+					}, timeout).Should(BeNil())
+				})
+
+				It("checks that, under normal conditions, reboot annotation, retryCount and lastRemediated are set", func() {
+					By("creating hetznerBareMetalRemediation object")
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					By("checking if host remediation occurred")
+					Eventually(func() bool {
+						if err := testEnv.Get(ctx, hetznerBaremetalRemediationkey, hetznerBareMetalRemediation); err != nil {
+							return false
+						}
+
+						if err := testEnv.Get(ctx, hostKey, host); err != nil {
+							return false
+						}
+
+						rebootAnnotationArguments := infrav1.RebootAnnotationArguments{Type: infrav1.RebootTypeHardware}
+
+						b, err := json.Marshal(rebootAnnotationArguments)
+						Expect(err).NotTo(HaveOccurred())
+
+						val, ok := host.Annotations[infrav1.RebootAnnotation]
+						if !ok {
+							return false
+						}
+
+						testEnv.GetLogger().Info("host annotations", "hostAnnotation", host.Annotations)
+						return !hetznerBareMetalRemediation.Status.LastRemediated.IsZero() && ptr.Deref(hetznerBareMetalRemediation.Status.RetryCount, 0) == 1 && val == string(b)
+					}, timeout).Should(BeTrue())
+				})
+
+				It("should delete machine if retry limit reached and reboot timed out (bm)", func() {
+					By("creating hetznerBareMetalRemediation object")
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					By("updating the status to waiting and setting the last remediation to past")
+					hetznerBaremetalRemediationPatchHelper, err := patch.NewHelper(hetznerBareMetalRemediation, testEnv.GetClient())
+					Expect(err).NotTo(HaveOccurred())
+
+					hetznerBareMetalRemediation.Status.Phase = infrav1.PhaseWaiting
+					hetznerBareMetalRemediation.Status.LastRemediated = metav1.Time{Time: time.Now().Add(-2 * time.Second)}
+
+					Expect(hetznerBaremetalRemediationPatchHelper.Patch(ctx, hetznerBareMetalRemediation)).NotTo(HaveOccurred())
+
+					By("checking if hetznerBareMetalRemediation is in deleting phase and capiMachine has MachineOwnerRemediatedCondition")
+					Eventually(func() bool {
+						if err := testEnv.Get(ctx, hetznerBaremetalRemediationkey, hetznerBareMetalRemediation); err != nil {
+							return false
+						}
+
+						return hetznerBareMetalRemediation.Status.Phase == infrav1.PhaseDeleting &&
+							isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) &&
+							isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason)
+					}, timeout).Should(BeTrue())
+				})
+
+				It("does no reboot and deletes the machine when retryLimit is 0", func() {
+					By("creating hetznerBareMetalRemediation object with retryLimit 0")
+					hetznerBareMetalRemediation.Spec.Strategy.RetryLimit = ptr.To(int32(0))
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					By("checking that no reboot happened and the machine is handed to CAPI for deletion")
+					Eventually(func() error {
+						if err := testEnv.Get(ctx, hetznerBaremetalRemediationkey, hetznerBareMetalRemediation); err != nil {
+							return err
+						}
+						if ptr.Deref(hetznerBareMetalRemediation.Status.RetryCount, 0) != 0 {
+							return fmt.Errorf("expected RetryCount 0, got %d", ptr.Deref(hetznerBareMetalRemediation.Status.RetryCount, 0))
+						}
+						if !hetznerBareMetalRemediation.Status.LastRemediated.IsZero() {
+							return fmt.Errorf("expected LastRemediated to be zero")
+						}
+						if hetznerBareMetalRemediation.Status.Phase != infrav1.PhaseDeleting {
+							return fmt.Errorf("expected Phase %q, got %q", infrav1.PhaseDeleting, hetznerBareMetalRemediation.Status.Phase)
+						}
+						if !isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) {
+							return fmt.Errorf("MachineOwnerRemediatedCondition not set")
+						}
+						if !isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason) {
+							return fmt.Errorf("native MachineOwnerRemediatedCondition not set")
+						}
+						return nil
+					}, timeout).ShouldNot(HaveOccurred())
+				})
+
+				It("does no reboot and deletes the machine when the Node is missing", func() {
+					By("setting the Node as deleted on capiMachine")
+					capiMachinePatchHelper, err := patch.NewHelper(capiMachine, testEnv.GetClient())
+					Expect(err).NotTo(HaveOccurred())
+					conditions.Set(capiMachine, metav1.Condition{
+						Type:    clusterv1.MachineHealthCheckSucceededCondition,
+						Status:  metav1.ConditionFalse,
+						Reason:  clusterv1.MachineHealthCheckNodeDeletedReason,
+						Message: "Node has been deleted",
+					})
+					Expect(capiMachinePatchHelper.Patch(ctx, capiMachine)).NotTo(HaveOccurred())
+
+					By("creating hetznerBareMetalRemediation object")
+					Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+					By("checking that no reboot happened and the machine is handed to CAPI for deletion")
+					Eventually(func() error {
+						if err := testEnv.Get(ctx, hetznerBaremetalRemediationkey, hetznerBareMetalRemediation); err != nil {
+							return err
+						}
+						if ptr.Deref(hetznerBareMetalRemediation.Status.RetryCount, 0) != 0 {
+							return fmt.Errorf("expected RetryCount 0, got %d", ptr.Deref(hetznerBareMetalRemediation.Status.RetryCount, 0))
+						}
+						if !hetznerBareMetalRemediation.Status.LastRemediated.IsZero() {
+							return fmt.Errorf("expected LastRemediated to be zero")
+						}
+						if hetznerBareMetalRemediation.Status.Phase != infrav1.PhaseDeleting {
+							return fmt.Errorf("expected Phase %q, got %q", infrav1.PhaseDeleting, hetznerBareMetalRemediation.Status.Phase)
+						}
+						if !isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) {
+							return fmt.Errorf("MachineOwnerRemediatedCondition not set")
+						}
+						if !isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason) {
+							return fmt.Errorf("native MachineOwnerRemediatedCondition not set")
+						}
+						return nil
+					}, timeout).ShouldNot(HaveOccurred())
+				})
+			})
+		})
+
+		Context("HetznerBareMetalHost will not get provisioned", func() {
+			BeforeEach(func() {
+				hostKey = client.ObjectKey{Name: hostName, Namespace: testNs.Name}
+
+				By("creating HetznerBareMetalHost")
+				host = helpers.BareMetalHost(
+					hostName,
+					testNs.Name,
+					helpers.WithRootDeviceHintRaid(),
+				)
+				Expect(testEnv.Create(ctx, host)).To(Succeed())
+
+				By("creating hetznerBaremetalMachine")
+				hetznerBaremetalMachine.Annotations = map[string]string{
+					infrav1.HostAnnotation: fmt.Sprintf("%s/%s", testNs.Name, hostName),
+				}
+				Expect(testEnv.Create(ctx, hetznerBaremetalMachine)).To(Succeed())
+			})
+
+			AfterEach(func() {
+				Expect(testEnv.Cleanup(ctx, host, hetznerBareMetalRemediation, hetznerBaremetalMachine)).To(Succeed())
+			})
+
+			It("should not try to remediate if HetznerBareMetalHost is not provisioned", func() {
+				By("creating hetznerBareMetalRemediation object")
+				Expect(testEnv.Create(ctx, hetznerBareMetalRemediation)).To(Succeed())
+
+				By("checking if capiMachine has the MachineOwnerRemediatedCondition")
+				Eventually(func() bool {
+					if err := testEnv.Get(ctx, capiMachineKey, capiMachine); err != nil {
+						return false
+					}
+
+					return isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) &&
+						isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason)
+				}, timeout).Should(BeTrue())
+			})
+		})
+	})
+})

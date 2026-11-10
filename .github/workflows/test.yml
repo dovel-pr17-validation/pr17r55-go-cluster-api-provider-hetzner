@@ -1,0 +1,94 @@
+name: Test Code
+# yamllint disable rule:line-length
+on: # yamllint disable-line rule:truthy
+  workflow_dispatch:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+      - "releases/**"
+      - "v1.1.x"
+    paths:
+      - "**.go"
+      - "**go.mod"
+      - "**go.sum"
+      - ".github/workflows/**"
+      - "Makefile"
+      - "images/builder/**"
+      - "images/caph/**"
+  push:
+    branches:
+      - main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.after }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: Test Code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Coverage result name
+        id: name
+        run: |
+          if [ ${{ github.event.pull_request }} ]; then
+          NAME=pr-${{ github.event.pull_request.number }}
+          else
+          NAME=${{ github.sha }}
+          fi
+          echo name=${NAME} >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+
+      - name: Install dependencies
+        run: make gotestsum go-cover-treemap setup-envtest
+
+      - name: Install go modules for test
+        shell: bash
+        run: |
+          cd test && go mod download
+
+      # Cache envtest binaries so we don't re-download from
+      # https://github.com/kubernetes-sigs/controller-tools/releases/...
+      # every run (helps avoid 503s).
+      - name: Cache envtest binaries
+        id: cache-envtest
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.local/share/kubebuilder-envtest
+          key: local-share-kubebuilder-envtest-${{ runner.os }}
+
+      - name: Running tests
+        run: make test-unit
+
+      - name: Create Report
+        run: make report-cover-html report-cover-treemap
+
+      - name: Report Slowest tests
+        run: hack/tools/bin/gotestsum tool slowest --num 10 --jsonfile .reports/go-test-output.json > .reports/slowest-tests.txt
+        if: ${{ !cancelled() }}
+
+      - name: Test Summary
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2.6
+        with:
+          paths: ".coverage/junit.xml"
+
+      - name: Check Release Manifests
+        shell: bash
+        run: |
+          make release-manifests
+          ./hack/check-release-manifests.sh
+
+      - name: Upload Report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: reports-${{ steps.name.outputs.name }}
+          path: .reports
+          include-hidden-files: true
+          retention-days: 30

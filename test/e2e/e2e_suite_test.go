@@ -1,0 +1,1028 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package e2e
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/guettli/check-conditions/pkg/checkconditions"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/klog/v2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/test/framework"
+	"sigs.k8s.io/cluster-api/test/framework/bootstrap"
+	"sigs.k8s.io/cluster-api/test/framework/clusterctl"
+	"sigs.k8s.io/cluster-api/test/framework/ginkgoextensions"
+	conditions "sigs.k8s.io/cluster-api/util/conditions"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	infrav1beta1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta1"
+	infrav1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta2"
+)
+
+// Test suite flags.
+var (
+	// configPath is the path to the e2e config file.
+	configPath string
+
+	// useExistingCluster instructs the test to use the current cluster instead of creating a new one (default discovery rules apply).
+	useExistingCluster bool
+
+	// artifactFolder is the folder to store e2e test artifacts.
+	artifactFolder string
+
+	// clusterctlConfig is the file which tests will use as a clusterctl config.
+	// If it is not set, a local clusterctl repository (including a clusterctl config) will be created automatically.
+	clusterctlConfig string
+
+	// kubetestConfigFilePath is the path to the kubetest configuration file.
+	kubetestConfigFilePath string
+
+	// alsoLogToFile enables additional logging to a timestamped 'ginkgo-log-MM-DD_HH-MM-SS.txt' file in the artifact folder.
+	// These logs also contain timestamps.
+	alsoLogToFile bool
+
+	// skipCleanup prevents cleanup of test resources e.g. for debug purposes.
+	skipCleanup bool
+)
+
+// Test suite global vars.
+var (
+	ctx                = ctrl.SetupSignalHandler()
+	suiteStartTime     = time.Now()
+	errPermanentHBMH   = errors.New("permanent HetznerBareMetalHost error")
+	errNoAvailableHost = errors.New("no available bare-metal host")
+
+	// e2eConfig to be used for this test, read from configPath.
+	e2eConfig *clusterctl.E2EConfig
+
+	// clusterctlConfigPath to be used for this test, created by generating a clusterctl local repository
+	// with the providers specified in the configPath.
+	clusterctlConfigPath string
+
+	// bootstrapClusterProvider manages provisioning of the the bootstrap cluster to be used for the e2e tests.
+	// Please note that provisioning will be skipped if e2e.use-existing-cluster is provided.
+	bootstrapClusterProvider bootstrap.ClusterProvider
+
+	// bootstrapClusterProxy allows to interact with the bootstrap cluster to be used for the e2e tests.
+	bootstrapClusterProxy framework.ClusterProxy
+)
+
+var ccmErrorCodeRegexp = regexp.MustCompile(`E\d{4}`)
+
+const (
+	ccmLogPollOverlap       = 2 * time.Second
+	ccmLogScannerBufferSize = 1024 * 1024
+)
+
+type ccmLogState struct {
+	mu                sync.Mutex
+	initialSince      time.Time
+	lastPollByCluster map[string]time.Time
+	seenLines         map[string]struct{}
+}
+
+func newCCMLogState(initialSince time.Time) *ccmLogState {
+	return &ccmLogState{
+		initialSince:      initialSince,
+		lastPollByCluster: map[string]time.Time{},
+		seenLines:         map[string]struct{}{},
+	}
+}
+
+// nextSince returns the timestamp used for incremental CCM log fetching.
+// Subsequent polls overlap slightly so lines at the query boundary are not missed.
+func (s *ccmLogState) nextSince(clusterName string) *metav1.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	since := s.initialSince
+	if lastPoll, ok := s.lastPollByCluster[clusterName]; ok {
+		since = lastPoll.Add(-ccmLogPollOverlap)
+		if since.Before(s.initialSince) {
+			since = s.initialSince
+		}
+	}
+
+	s.lastPollByCluster[clusterName] = time.Now()
+	sinceTime := metav1.NewTime(since)
+
+	return &sinceTime
+}
+
+// markSeen deduplicates lines so overlapping log windows and repeated pod state
+// snapshots are only printed once.
+func (s *ccmLogState) markSeen(line string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.seenLines[line]; ok {
+		return false
+	}
+	s.seenLines[line] = struct{}{}
+
+	return true
+}
+
+func init() {
+	flag.StringVar(&configPath, "e2e.config", "", "path to the e2e config file")
+	flag.StringVar(&artifactFolder, "e2e.artifacts-folder", "", "folder where e2e test artifact should be stored")
+	flag.BoolVar(&alsoLogToFile, "e2e.also-log-to-file", true, "if true, ginkgo logs are additionally written to a `ginkgo-log-MM-DD_HH-MM-SS.txt` file in the artifacts folder (including timestamps)")
+	flag.BoolVar(&skipCleanup, "e2e.skip-resource-cleanup", false, "if true, the resource cleanup after tests will be skipped")
+	flag.StringVar(&clusterctlConfig, "e2e.clusterctl-config", "", "file which tests will use as a clusterctl config. If it is not set, a local clusterctl repository (including a clusterctl config) will be created automatically.")
+	flag.BoolVar(&useExistingCluster, "e2e.use-existing-cluster", false, "if true, the test uses the current cluster instead of creating a new one (default discovery rules apply)")
+	flag.StringVar(&kubetestConfigFilePath, "kubetest.config-file", "", "path to the kubetest configuration file")
+
+	ctrl.SetLogger(klog.Background())
+}
+
+func TestE2E(t *testing.T) {
+	suiteStartTime = time.Now()
+
+	// If running in prow, make sure to use the artifacts folder that will be reported in test grid (ignoring the value provided by flag).
+	if prowArtifactFolder, exists := os.LookupEnv("ARTIFACTS"); exists {
+		artifactFolder = prowArtifactFolder
+	}
+
+	RegisterFailHandler(Fail)
+
+	if alsoLogToFile {
+		logFileName := fmt.Sprintf("ginkgo-log-%s.txt", time.Now().Format("01-02_15-04-05"))
+		w, err := ginkgoextensions.EnableFileLogging(filepath.Join(artifactFolder, logFileName))
+		Expect(err).ToNot(HaveOccurred())
+		defer func() { _ = w.Close() }()
+	}
+
+	RunSpecs(t, "caph-e2e")
+}
+
+// Using a SynchronizedBeforeSuite for controlling how to create resources shared across ParallelNodes (~ginkgo threads).
+// The local clusterctl repository & the bootstrap cluster are created once and shared across all the tests.
+var _ = SynchronizedBeforeSuite(func() []byte {
+	// Before all ParallelNodes.
+
+	Expect(configPath).To(BeAnExistingFile(), "Invalid test suite argument. e2e.config should be an existing file.")
+	Expect(os.MkdirAll(artifactFolder, 0o755)).To(Succeed(), "Invalid test suite argument. Can't create e2e.artifacts-folder %q", artifactFolder) //nolint:gosec
+
+	log("Initializing a runtime.Scheme with all the GVK relevant for this test")
+	scheme := initScheme()
+
+	Byf("Loading the e2e test configuration from %q", configPath)
+
+	log(fmt.Sprintf("Loading the e2e test configuration from %q", configPath))
+	e2eConfig = loadE2EConfig(ctx, configPath)
+
+	log(fmt.Sprintf("Creating a clusterctl local repository into %q", artifactFolder))
+	clusterctlConfigPath = createClusterctlLocalRepository(ctx, e2eConfig, filepath.Join(artifactFolder, "repository"))
+
+	log("Setting up the bootstrap cluster")
+	bootstrapClusterProvider, bootstrapClusterProxy = setupBootstrapCluster(e2eConfig, scheme, useExistingCluster)
+
+	log("Initializing the bootstrap cluster")
+	initBootstrapCluster(ctx, bootstrapClusterProxy, e2eConfig, clusterctlConfigPath, artifactFolder)
+	return []byte(
+		strings.Join([]string{
+			artifactFolder,
+			configPath,
+			clusterctlConfigPath,
+			bootstrapClusterProxy.GetKubeconfigPath(),
+		}, ","),
+	)
+}, func(data []byte) {
+	// Before each ParallelNode.
+
+	parts := strings.Split(string(data), ",")
+	Expect(parts).To(HaveLen(4))
+
+	artifactFolder = parts[0]
+	configPath = parts[1]
+	clusterctlConfigPath = parts[2]
+	kubeconfigPath := parts[3]
+
+	e2eConfig = loadE2EConfig(ctx, configPath)
+	bootstrapClusterProxy = framework.NewClusterProxy("bootstrap", kubeconfigPath, initScheme(), framework.WithMachineLogCollector(logCollector{}))
+})
+
+// Using a SynchronizedAfterSuite for controlling how to delete resources shared across ParallelNodes (~ginkgo threads).
+// The bootstrap cluster is shared across all the tests, so it should be deleted only after all ParallelNodes completes.
+// The local clusterctl repository is preserved like everything else created into the artifact folder.
+var _ = SynchronizedAfterSuite(func() {
+	// After each ParallelNode.
+	log("Tearing down the management cluster")
+	if !skipCleanup {
+		tearDown(ctx, nil, bootstrapClusterProxy)
+	}
+}, func() {
+	// After all ParallelNodes.
+	if !skipCleanup {
+		tearDown(ctx, bootstrapClusterProvider, nil)
+	}
+})
+
+func initScheme() *runtime.Scheme {
+	sc := runtime.NewScheme()
+	framework.TryAddDefaultSchemes(sc)
+	_ = infrav1beta1.AddToScheme(sc)
+	_ = infrav1.AddToScheme(sc)
+	return sc
+}
+
+func loadE2EConfig(ctx context.Context, configPath string) *clusterctl.E2EConfig {
+	config := clusterctl.LoadE2EConfig(ctx, clusterctl.LoadE2EConfigInput{ConfigPath: configPath})
+	Expect(config).ToNot(BeNil(), "Failed to load E2E config from %s", configPath)
+
+	return config
+}
+
+func createClusterctlLocalRepository(ctx context.Context, config *clusterctl.E2EConfig, repositoryFolder string) string {
+	createRepositoryInput := clusterctl.CreateRepositoryInput{
+		E2EConfig:        config,
+		RepositoryFolder: repositoryFolder,
+	}
+
+	// Ensuring a CCM file is defined in the config and register a FileTransformation to inject the referenced file as in place of the CCM_RESOURCES envSubst variable.
+	Expect(config.Variables).To(HaveKey(CiliumPath), "Missing %s variable in the config", CiliumPath)
+	ciliumPath := config.GetVariableOrEmpty(CiliumPath)
+	Expect(ciliumPath).To(BeAnExistingFile(), "The %s variable should resolve to an existing file", CiliumPath)
+	createRepositoryInput.RegisterClusterResourceSetConfigMapTransformation(ciliumPath, CiliumResources)
+
+	// Ensuring a CCM file is defined in the config and register a FileTransformation to inject the referenced file as in place of the CCM_RESOURCES envSubst variable.
+	Expect(config.Variables).To(HaveKey(CCMPath), "Missing %s variable in the config", CCMPath)
+	ccmPath := config.GetVariableOrEmpty(CCMPath)
+	Expect(ccmPath).To(BeAnExistingFile(), "The %s variable should resolve to an existing file", CCMPath)
+	createRepositoryInput.RegisterClusterResourceSetConfigMapTransformation(ccmPath, CCMResources)
+
+	// Ensuring a CCM file is defined for clusters with networks in the config and register a FileTransformation to inject the referenced file as in place of the CCM_RESOURCES envSubst variable.
+	Expect(config.Variables).To(HaveKey(CCMNetworkPath), "Missing %s variable in the config", CCMNetworkPath)
+	ccmNetworkPath := config.GetVariableOrEmpty(CCMNetworkPath)
+	Expect(ccmNetworkPath).To(BeAnExistingFile(), "The %s variable should resolve to an existing file", CCMNetworkPath)
+	createRepositoryInput.RegisterClusterResourceSetConfigMapTransformation(ccmNetworkPath, CCMNetworkResources)
+
+	// Ensuring a CCM file is defined for clusters with networks in the config and register a FileTransformation to inject the referenced file as in place of the CCM_RESOURCES envSubst variable.
+	Expect(config.Variables).To(HaveKey(CCMHetznerPath), "Missing %s variable in the config", CCMHetznerPath)
+	ccmHetznerPath := config.GetVariableOrEmpty(CCMHetznerPath)
+	Expect(ccmHetznerPath).To(BeAnExistingFile(), "The %s variable should resolve to an existing file", CCMHetznerPath)
+	createRepositoryInput.RegisterClusterResourceSetConfigMapTransformation(ccmHetznerPath, CCMHetznerResources)
+
+	clusterctlConfig := clusterctl.CreateRepository(ctx, createRepositoryInput)
+	Expect(clusterctlConfig).To(BeAnExistingFile(), "The clusterctl config file does not exists in the local repository %s", repositoryFolder)
+
+	return clusterctlConfig
+}
+
+// pullKindNodeImageWithRetry pulls the kind node image before cluster creation to handle transient
+// Docker Hub failures without aborting the whole suite.
+func pullKindNodeImageWithRetry(ctx context.Context) {
+	image := fmt.Sprintf("%s:%s", bootstrap.DefaultNodeImageRepository, bootstrap.DefaultNodeImageVersion)
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		out, err := exec.CommandContext(ctx, "docker", "pull", image).CombinedOutput() //nolint:gosec
+		if err == nil {
+			return
+		}
+		lastErr = err
+		GinkgoLogr.Info("docker pull failed", "image", image, "attempt", attempt, "maxAttempts", maxAttempts, "output", string(out))
+		if attempt < maxAttempts {
+			time.Sleep(time.Duration(attempt) * 15 * time.Second)
+		}
+	}
+	Expect(lastErr).ToNot(HaveOccurred(), "Failed to pull kind node image %s after %d attempts", image, maxAttempts)
+}
+
+func setupBootstrapCluster(config *clusterctl.E2EConfig, scheme *runtime.Scheme, useExistingCluster bool) (bootstrap.ClusterProvider, framework.ClusterProxy) {
+	var clusterProvider bootstrap.ClusterProvider
+	kubeconfigPath := ""
+	if !useExistingCluster {
+		pullKindNodeImageWithRetry(ctx)
+		clusterProvider = bootstrap.CreateKindBootstrapClusterAndLoadImages(ctx, bootstrap.CreateKindBootstrapClusterAndLoadImagesInput{
+			Name:               config.ManagementClusterName,
+			RequiresDockerSock: config.HasDockerProvider(),
+			Images:             config.Images,
+		})
+		Expect(clusterProvider).ToNot(BeNil(), "Failed to create a bootstrap cluster")
+
+		kubeconfigPath = clusterProvider.GetKubeconfigPath()
+		Expect(kubeconfigPath).To(BeAnExistingFile(), "Failed to get the kubeconfig file for the bootstrap cluster")
+	}
+
+	clusterProxy := framework.NewClusterProxy("bootstrap", kubeconfigPath, scheme, framework.WithMachineLogCollector(logCollector{}))
+	Expect(clusterProxy).ToNot(BeNil(), "Failed to get a bootstrap cluster proxy")
+
+	return clusterProvider, clusterProxy
+}
+
+// logStatusContinuously does log the state of the mgt-cluster and the wl-clusters continuously.
+func logStatusContinuously(ctx context.Context, restConfig *restclient.Config, c client.Client) {
+	defer GinkgoRecover()
+	ccmLogs := newCCMLogState(suiteStartTime)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log("Context canceled, stopping logStatusContinuously")
+			return
+		case <-time.After(30 * time.Second):
+			err := logStatus(ctx, restConfig, c, ccmLogs)
+			if err != nil {
+				if errors.Is(err, errPermanentHBMH) || errors.Is(err, errNoAvailableHost) {
+					Fail(err.Error())
+				}
+				log(fmt.Sprintf("Error logging status: %v", err))
+			}
+		}
+	}
+}
+
+// logStatus logs the current state of the mgt-cluster and the wl-clusters once.
+// It gets called again and again by logStatusContinuously.
+func logStatus(ctx context.Context, restConfig *restclient.Config, c client.Client, ccmLogs *ccmLogState) error {
+	log("^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^")
+	log(fmt.Sprintf("≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡ %s (elapsed: %s) <<< Start logging status",
+		time.Now().Format("2006-01-02 15:04:05"),
+		time.Since(suiteStartTime).Round(time.Second),
+	))
+
+	if err := logCaphDeployment(ctx, c); err != nil {
+		return err
+	}
+
+	if err := logBareMetalHostStatus(ctx, c); err != nil {
+		return err
+	}
+
+	if err := checkBareMetalMachineNoAvailableHost(ctx, c); err != nil {
+		return err
+	}
+
+	if err := logHCloudMachineStatus(ctx, c); err != nil {
+		return err
+	}
+
+	// Log the unhealthy conditions of the mgt-cluster
+	if err := logConditions(ctx, "mgt-cluster", restConfig); err != nil {
+		return err
+	}
+
+	// log the unhealthy conditions of the wl-clusters.
+	clusterList := &clusterv1.ClusterList{}
+	err := c.List(ctx, clusterList)
+	if err != nil {
+		return fmt.Errorf("failed to list clusters: %w", err)
+	}
+
+	for _, cluster := range clusterList.Items {
+		// get the secret containing the kubeconfig.
+		secretName := cluster.Name + "-kubeconfig"
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: cluster.Namespace,
+			},
+		}
+
+		err := c.Get(ctx, client.ObjectKeyFromObject(secret), secret)
+		if err != nil {
+			log(fmt.Sprintf("Failed to get Secret %s/%s: %v", cluster.Namespace, secretName, err))
+			continue
+		}
+
+		data := secret.Data["value"]
+		if len(data) == 0 {
+			log(fmt.Sprintf("Failed to get Secret %s/%s: content is empty", cluster.Namespace, secretName))
+			continue
+		}
+
+		// create restConfig from kubeconfig.
+		restConfig, err := clientcmd.RESTConfigFromKubeConfig(data)
+		if err != nil {
+			log(fmt.Sprintf("Failed to create REST config from Secret %s/%s: %v", cluster.Namespace, secretName, err))
+			continue
+		}
+
+		// log the conditions of this wl-cluster
+		err = logConditions(ctx, "wl-cluster "+cluster.Name, restConfig)
+		if err != nil {
+			log(fmt.Sprintf("Failed to log Conditions %s/%s: %v", cluster.Namespace, secretName, err))
+			continue
+		}
+		err = logNodes(ctx, "wl-cluster "+cluster.Name, restConfig)
+		if err != nil {
+			log(fmt.Sprintf("Failed to log Nodes %s/%s: %v", cluster.Namespace, secretName, err))
+			continue
+		}
+		err = logCCMDeployments(ctx, "wl-cluster "+cluster.Name, restConfig)
+		if err != nil {
+			log(fmt.Sprintf("Failed to log CCM deployment %s/%s: %v", cluster.Namespace, secretName, err))
+			continue
+		}
+		err = logCCMPodLogs(ctx, "wl-cluster "+cluster.Name, restConfig, ccmLogs)
+		if err != nil {
+			log(fmt.Sprintf("Failed to log CCM pod logs %s/%s: %v", cluster.Namespace, secretName, err))
+			continue
+		}
+	}
+
+	log(fmt.Sprintf("≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡≡ %s End logging status >>>", time.Now().Format("2006-01-02 15:04:05")))
+
+	return nil
+}
+
+func logConditions(ctx context.Context, clusterName string, restConfig *restclient.Config) error {
+	restConfig.QPS = -1 // Since Kubernetes 1.29 "API Priority and Fairness" handles that.
+	counter, err := checkconditions.RunAndGetCounter(ctx, restConfig, &checkconditions.Arguments{})
+	if err != nil {
+		return fmt.Errorf("check conditions: %w", err)
+	}
+	log(fmt.Sprintf("----------------------------------------------- %s ---- Unhealthy Conditions: %d",
+		clusterName,
+		len(counter.Lines)))
+
+	for _, line := range counter.Lines {
+		log(line)
+	}
+	return nil
+}
+
+// logCCMPodLogs logs new CCM pod state details and container logs, including
+// sidecars, for the current polling interval.
+func logCCMPodLogs(ctx context.Context, clusterName string, restConfig *restclient.Config, state *ccmLogState) error {
+	if state == nil {
+		return nil
+	}
+
+	cfg := restclient.CopyConfig(restConfig)
+	cfg.QPS = -1 // Since Kubernetes 1.29 "API Priority and Fairness" handles that.
+
+	kubeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("create kubernetes client from restConfig: %w", err)
+	}
+
+	ccmDeployments, err := listCCMDeployments(ctx, kubeClient)
+	if err != nil {
+		return err
+	}
+	if len(ccmDeployments) == 0 {
+		return nil
+	}
+
+	sinceTime := state.nextSince(clusterName)
+	printedHeader := false
+	var errs []error
+
+	for _, deployment := range ccmDeployments {
+		podList, err := kubeClient.CoreV1().Pods(deployment.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: metav1.FormatLabelSelector(deployment.Spec.Selector),
+		})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("list pods for deployment %s/%s: %w", deployment.Namespace, deployment.Name, err))
+			continue
+		}
+
+		sort.Slice(podList.Items, func(i, j int) bool {
+			return podList.Items[i].Name < podList.Items[j].Name
+		})
+
+		for _, pod := range podList.Items {
+			podStateLines := collectNewCCMPodStateLines(clusterName, pod, state)
+			if len(podStateLines) > 0 && !printedHeader {
+				log(fmt.Sprintf("----------------------------------------------- %s ---- CCM Logs", clusterName))
+				printedHeader = true
+			}
+			for _, line := range podStateLines {
+				log(line)
+			}
+
+			if !podSupportsLogStreaming(pod) {
+				continue
+			}
+
+			for _, containerName := range ccmContainerNames(pod) {
+				stream, err := kubeClient.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+					Container: containerName,
+					SinceTime: sinceTime,
+				}).Stream(ctx)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("stream logs for pod %s/%s container %s: %w", pod.Namespace, pod.Name, containerName, err))
+					continue
+				}
+
+				newLines, readErr := collectNewCCMLogLines(stream, clusterName, pod.Name, containerName, state)
+				_ = stream.Close()
+				if readErr != nil {
+					errs = append(errs, fmt.Errorf("read logs for pod %s/%s container %s: %w", pod.Namespace, pod.Name, containerName, readErr))
+					continue
+				}
+
+				if len(newLines) == 0 {
+					continue
+				}
+				if !printedHeader {
+					log(fmt.Sprintf("----------------------------------------------- %s ---- CCM Logs", clusterName))
+					printedHeader = true
+				}
+				for _, line := range newLines {
+					log(line)
+				}
+			}
+		}
+	}
+
+	return kerrors.NewAggregate(errs)
+}
+
+func listCCMDeployments(ctx context.Context, kubeClient *kubernetes.Clientset) ([]appsv1.Deployment, error) {
+	deployments, err := kubeClient.AppsV1().Deployments(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list deployments: %w", err)
+	}
+
+	ccmDeployments := make([]appsv1.Deployment, 0, len(deployments.Items))
+	for _, deployment := range deployments.Items {
+		if isCCMDeploymentName(deployment.Name) {
+			ccmDeployments = append(ccmDeployments, deployment)
+		}
+	}
+
+	sort.Slice(ccmDeployments, func(i, j int) bool {
+		return ccmDeployments[i].Name < ccmDeployments[j].Name
+	})
+
+	return ccmDeployments, nil
+}
+
+func isCCMDeploymentName(name string) bool {
+	ccmDeploymentNameSuffixes := []string{
+		"ccm",
+		"cloud-controller-manager",
+		"ccm-hetzner",
+		"ccm-hcloud",
+	}
+	for _, suffix := range ccmDeploymentNameSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func ccmContainerNames(pod corev1.Pod) []string {
+	names := make([]string, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+	seen := map[string]struct{}{}
+
+	for _, container := range pod.Spec.InitContainers {
+		if _, ok := seen[container.Name]; ok {
+			continue
+		}
+		names = append(names, container.Name)
+		seen[container.Name] = struct{}{}
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if _, ok := seen[container.Name]; ok {
+			continue
+		}
+		names = append(names, container.Name)
+		seen[container.Name] = struct{}{}
+	}
+
+	return names
+}
+
+func collectNewCCMLogLines(reader io.Reader, clusterName, podName, containerName string, state *ccmLogState) ([]string, error) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), ccmLogScannerBufferSize)
+
+	lines := []string{}
+	for scanner.Scan() {
+		rawLine := strings.TrimSpace(scanner.Text())
+		if rawLine == "" {
+			continue
+		}
+
+		formattedLine := formatCCMLogLine(clusterName, podName, containerName, rawLine)
+		if !state.markSeen(formattedLine) {
+			continue
+		}
+		lines = append(lines, formattedLine)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return lines, nil
+}
+
+func formatCCMLogLine(clusterName, podName, containerName, rawLine string) string {
+	line := fmt.Sprintf("CCM %s %s/%s: %s", clusterName, podName, containerName, rawLine)
+	if ccmErrorCodeRegexp.MatchString(rawLine) {
+		return "\x1b[1;30;43m" + line + "\x1b[0m"
+	}
+
+	return line
+}
+
+func collectNewCCMPodStateLines(clusterName string, pod corev1.Pod, state *ccmLogState) []string {
+	if state == nil {
+		return nil
+	}
+
+	lines := []string{}
+	for _, line := range formatCCMPodStateLines(clusterName, pod) {
+		if !state.markSeen(line) {
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	return lines
+}
+
+func formatCCMPodStateLines(clusterName string, pod corev1.Pod) []string {
+	lines := []string{
+		fmt.Sprintf("CCM %s pod %s phase=%s", clusterName, pod.Name, pod.Status.Phase),
+	}
+
+	for _, condition := range pod.Status.Conditions {
+		if condition.Status != corev1.ConditionTrue {
+			lines = append(lines, fmt.Sprintf(
+				"CCM %s pod %s condition %s=%s reason=%s message=%q",
+				clusterName,
+				pod.Name,
+				condition.Type,
+				condition.Status,
+				condition.Reason,
+				condition.Message,
+			))
+		}
+	}
+
+	for _, containerStatus := range pod.Status.InitContainerStatuses {
+		if line, ok := formatCCMContainerStateLine(clusterName, pod.Name, "initContainer", containerStatus); ok {
+			lines = append(lines, line)
+		}
+	}
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if line, ok := formatCCMContainerStateLine(clusterName, pod.Name, "container", containerStatus); ok {
+			lines = append(lines, line)
+		}
+	}
+
+	return lines
+}
+
+func formatCCMContainerStateLine(clusterName, podName, containerType string, containerStatus corev1.ContainerStatus) (string, bool) {
+	switch {
+	case containerStatus.State.Waiting != nil:
+		return fmt.Sprintf(
+			"CCM %s pod %s %s %s waiting reason=%s message=%q",
+			clusterName,
+			podName,
+			containerType,
+			containerStatus.Name,
+			containerStatus.State.Waiting.Reason,
+			containerStatus.State.Waiting.Message,
+		), true
+	case containerStatus.State.Terminated != nil:
+		return fmt.Sprintf(
+			"CCM %s pod %s %s %s terminated exitCode=%d reason=%s message=%q",
+			clusterName,
+			podName,
+			containerType,
+			containerStatus.Name,
+			containerStatus.State.Terminated.ExitCode,
+			containerStatus.State.Terminated.Reason,
+			containerStatus.State.Terminated.Message,
+		), true
+	case !containerStatus.Ready:
+		return fmt.Sprintf(
+			"CCM %s pod %s %s %s ready=%t restartCount=%d",
+			clusterName,
+			podName,
+			containerType,
+			containerStatus.Name,
+			containerStatus.Ready,
+			containerStatus.RestartCount,
+		), true
+	default:
+		return "", false
+	}
+}
+
+func podSupportsLogStreaming(pod corev1.Pod) bool {
+	return pod.Status.Phase != corev1.PodPending
+}
+
+func logNodes(ctx context.Context, clusterName string, restConfig *restclient.Config) error {
+	cfg := restclient.CopyConfig(restConfig)
+	cfg.QPS = -1 // Since Kubernetes 1.29 "API Priority and Fairness" handles that.
+
+	kubeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("create kubernetes client from restConfig: %w", err)
+	}
+
+	nodes, err := kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+
+	sort.Slice(nodes.Items, func(i, j int) bool {
+		return nodes.Items[i].Name < nodes.Items[j].Name
+	})
+
+	log(fmt.Sprintf("----------------------------------------------- %s ---- Nodes: %d",
+		clusterName, len(nodes.Items)))
+
+	for _, node := range nodes.Items {
+		addresses := make([]string, 0, len(node.Status.Addresses))
+		for _, address := range node.Status.Addresses {
+			addresses = append(addresses, fmt.Sprintf("%s=%s", address.Type, address.Address))
+		}
+		sort.Strings(addresses)
+
+		addressText := "<none>"
+		if len(addresses) > 0 {
+			addressText = strings.Join(addresses, ", ")
+		}
+
+		log(fmt.Sprintf("Node: %s providerID=%q addresses=[%s]",
+			node.Name,
+			node.Spec.ProviderID,
+			addressText,
+		))
+		if node.Spec.ProviderID == "" {
+			log(fmt.Sprintf("  !!! WARNING !!! Node %s has empty providerID (check ccm)", node.Name))
+		}
+	}
+
+	return nil
+}
+
+func logCCMDeployments(ctx context.Context, clusterName string, restConfig *restclient.Config) error {
+	cfg := restclient.CopyConfig(restConfig)
+	cfg.QPS = -1 // Since Kubernetes 1.29 "API Priority and Fairness" handles that.
+
+	kubeClient, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("create kubernetes client from restConfig: %w", err)
+	}
+
+	ccmDeployments, err := listCCMDeployments(ctx, kubeClient)
+	if err != nil {
+		return err
+	}
+
+	log(fmt.Sprintf("----------------------------------------------- %s ---- CCM Deployment: %d",
+		clusterName, len(ccmDeployments)))
+
+	if len(ccmDeployments) == 0 {
+		log("  !!! WARNING !!! Expected exactly 1 CCM deployment, found none")
+	}
+	if len(ccmDeployments) > 1 {
+		log(fmt.Sprintf("  !!! WARNING !!! Expected exactly 1 CCM deployment, found %d", len(ccmDeployments)))
+	}
+
+	if len(ccmDeployments) == 0 {
+		return nil
+	}
+
+	for _, deployment := range ccmDeployments {
+		log(fmt.Sprintf("Deployment: %s/%s", deployment.Namespace, deployment.Name))
+		logDeploymentContainerImages("initContainer", deployment.Spec.Template.Spec.InitContainers)
+		logDeploymentContainerImages("container", deployment.Spec.Template.Spec.Containers)
+	}
+
+	return nil
+}
+
+func logDeploymentContainerImages(containerType string, containers []corev1.Container) {
+	for _, container := range containers {
+		log(fmt.Sprintf("  %s %s image=%s",
+			containerType,
+			container.Name,
+			container.Image,
+		))
+	}
+}
+
+func logHCloudMachineStatus(ctx context.Context, c client.Client) error {
+	hmList := &infrav1.HCloudMachineList{}
+	err := c.List(ctx, hmList)
+	if err != nil {
+		return err
+	}
+
+	if len(hmList.Items) == 0 {
+		return nil
+	}
+
+	caphDeployment := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "caph-controller-manager",
+			Namespace: "caph-system",
+		},
+	}
+	err = c.Get(ctx, client.ObjectKeyFromObject(&caphDeployment), &caphDeployment)
+	if err != nil {
+		return fmt.Errorf("failed to get caph-controller-manager deployment: %w", err)
+	}
+
+	log(fmt.Sprintf("--------------------------------------------------- HCloudMachines %s",
+		caphDeployment.Spec.Template.Spec.Containers[0].Image))
+
+	for i := range hmList.Items {
+		hm := &hmList.Items[i]
+		if hm.Status.InstanceState == "" {
+			continue
+		}
+		addresses := make([]string, 0)
+		for _, a := range hm.Status.Addresses {
+			addresses = append(addresses, a.Address)
+		}
+
+		log("HCloudMachine: " + hm.Name + " " + hm.Spec.ProviderID + " " + strings.Join(addresses, " "))
+		log("  ProvisioningState: " + string(hm.Status.InstanceState))
+
+		readyC := conditions.Get(hm, clusterv1.ReadyCondition)
+		msg := ""
+		reason := ""
+		state := "?"
+		if readyC != nil {
+			msg = readyC.Message
+			reason = readyC.Reason
+			state = string(readyC.Status)
+		}
+		log("  Ready Condition: " + state + " " + reason + " " + msg)
+	}
+	return nil
+}
+
+func logCaphDeployment(ctx context.Context, c client.Client) error {
+	caphDeployment := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "caph-controller-manager",
+			Namespace: "caph-system",
+		},
+	}
+	err := c.Get(ctx, client.ObjectKeyFromObject(&caphDeployment), &caphDeployment)
+	if err != nil {
+		return fmt.Errorf("failed to get caph-controller-manager deployment: %w", err)
+	}
+
+	log(fmt.Sprintf("--------------------------------------------------- Caph deployment %s",
+		caphDeployment.Spec.Template.Spec.Containers[0].Image))
+
+	return nil
+}
+
+func logBareMetalHostStatus(ctx context.Context, c client.Client) error {
+	hbmhList := &infrav1.HetznerBareMetalHostList{}
+	err := c.List(ctx, hbmhList)
+	if err != nil {
+		return err
+	}
+
+	if len(hbmhList.Items) == 0 {
+		return nil
+	}
+
+	caphDeployment := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "caph-controller-manager",
+			Namespace: "caph-system",
+		},
+	}
+	err = c.Get(ctx, client.ObjectKeyFromObject(&caphDeployment), &caphDeployment)
+	if err != nil {
+		return fmt.Errorf("failed to get caph-controller-manager deployment: %w", err)
+	}
+
+	log(fmt.Sprintf("--------------------------------------------------- BareMetalHosts %s",
+		caphDeployment.Spec.Template.Spec.Containers[0].Image))
+
+	var allErrors []error
+	for i := range hbmhList.Items {
+		hbmh := &hbmhList.Items[i]
+		if hbmh.Status.ProvisioningState == "" {
+			continue
+		}
+
+		// log infos about that hbmh.
+		hbmmName := hbmh.Spec.ConsumerRef.Name
+		logMsg := "BareMetalHost: " + hbmh.Name + " " + fmt.Sprint(hbmh.Spec.ServerID) +
+			" | IPv4: " + hbmh.Status.IPv4
+		if hbmmName != "" {
+			logMsg += " | HBMM: " + hbmmName
+		}
+		log(logMsg)
+
+		// Show an Error, if set. The message for the current error is on the ActionCompleted
+		// condition.
+		errMessage := ""
+		if ac := conditions.Get(hbmh, infrav1.HetznerBareMetalHostActionCompletedCondition); ac != nil {
+			errMessage = ac.Message
+		}
+		eMsg := string(hbmh.Status.ErrorType) + " " + errMessage
+		eMsg = strings.TrimSpace(eMsg)
+		if eMsg != "" {
+			log("  Error: " + eMsg)
+			if hbmh.Status.ErrorType == infrav1.ErrorTypePermanent {
+				allErrors = append(allErrors, fmt.Errorf("%w on HetznerBareMetalHost (stopping e2e test now) %q: %s", errPermanentHBMH, hbmh.Name, eMsg))
+			}
+		}
+
+		readyC := conditions.Get(hbmh, clusterv1.ReadyCondition)
+		msg := ""
+		reason := ""
+		state := "?"
+		if readyC != nil {
+			msg = readyC.Message
+			reason = readyC.Reason
+			state = string(readyC.Status)
+		}
+		log("  ProvisioningState: " + string(hbmh.Status.ProvisioningState) + " | Ready Condition: " + state + " " + reason + " " + msg)
+	}
+	return errors.Join(allErrors...)
+}
+
+func checkBareMetalMachineNoAvailableHost(ctx context.Context, c client.Client) error {
+	machineList := &infrav1.HetznerBareMetalMachineList{}
+	if err := c.List(ctx, machineList); err != nil {
+		return fmt.Errorf("failed to list HetznerBareMetalMachines: %w", err)
+	}
+	for _, machine := range machineList.Items {
+		if machine.DeletionTimestamp != nil {
+			continue
+		}
+		cond := conditions.Get(&machine, infrav1.HetznerBareMetalMachineHostAssociatedCondition)
+		if cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == infrav1.HetznerBareMetalMachineNoAvailableHostReason {
+			return fmt.Errorf("%w: HetznerBareMetalMachine %s/%s: %s", errNoAvailableHost, machine.Namespace, machine.Name, cond.Message)
+		}
+	}
+	return nil
+}
+
+func initBootstrapCluster(ctx context.Context, bootstrapClusterProxy framework.ClusterProxy, config *clusterctl.E2EConfig, clusterctlConfig, artifactFolder string) {
+	go logStatusContinuously(ctx, bootstrapClusterProxy.GetRESTConfig(), bootstrapClusterProxy.GetClient())
+	clusterctl.InitManagementClusterAndWatchControllerLogs(ctx, clusterctl.InitManagementClusterAndWatchControllerLogsInput{
+		ClusterProxy:            bootstrapClusterProxy,
+		ClusterctlConfigPath:    clusterctlConfig,
+		InfrastructureProviders: config.InfrastructureProviders(),
+		LogFolder:               filepath.Join(artifactFolder, "clusters", bootstrapClusterProxy.GetName()),
+	}, config.GetIntervals(bootstrapClusterProxy.GetName(), "wait-controllers")...)
+}
+
+func tearDown(ctx context.Context, bootstrapClusterProvider bootstrap.ClusterProvider, bootstrapClusterProxy framework.ClusterProxy) {
+	if bootstrapClusterProxy != nil {
+		bootstrapClusterProxy.Dispose(ctx)
+	}
+	if bootstrapClusterProvider != nil {
+		bootstrapClusterProvider.Dispose(ctx)
+	}
+}
+
+func log(msg string) {
+	_, _ = fmt.Fprintln(GinkgoWriter, msg)
+}

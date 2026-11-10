@@ -1,0 +1,269 @@
+version: "2"
+run:
+  go: "1.25"
+  modules-download-mode: readonly
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - containedctx
+    - copyloopvar
+    - dogsled
+    - durationcheck
+    - errcheck
+    - errchkjson
+    - gocritic
+    - godot
+    - goprintffuncname
+    - gosec
+    - govet
+    - importas
+    - ineffassign
+    - loggercheck
+    - misspell
+    - nakedret
+    - nilerr
+    - noctx
+    - nolintlint
+    - prealloc
+    - predeclared
+    - revive
+    - rowserrcheck
+    - staticcheck
+    - thelper
+    - unconvert
+    - unparam
+    - unused
+    - whitespace
+  settings:
+    govet:
+      enable:
+        - nilness
+    gocritic:
+      disabled-checks:
+        - appendAssign
+        - dupImport # https://github.com/go-critic/go-critic/issues/845
+        - evalOrder
+        - ifElseChain
+        - octalLiteral
+        - regexpSimplify
+        - sloppyReassign
+        - truncateCmp
+        - typeDefFirst
+        - unnamedResult
+        - unnecessaryDefer
+        - whyNoLint
+        - wrapperFunc
+        - rangeValCopy
+        - hugeParam
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - performance
+    godot:
+      #   declarations - for top level declaration comments (default);
+      #   toplevel     - for top level comments;
+      #   all          - for all comments.
+      scope: toplevel
+      exclude:
+        - ^ \+.*
+        - ^ ANCHOR.*
+    gosec:
+      excludes:
+        - G307 # Deferring unsafe method "Close" on type "\*os.File"
+        - G108 # Profiling endpoint is automatically exposed on /debug/pprof
+        - G106 # Allowing for insecure ssh
+    importas:
+      alias:
+        # Kubernetes
+        - pkg: k8s.io/api/core/v1
+          alias: corev1
+        - pkg: k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1
+          alias: apiextensionsv1
+        - pkg: k8s.io/apimachinery/pkg/apis/meta/v1
+          alias: metav1
+        - pkg: k8s.io/apimachinery/pkg/api/errors
+          alias: apierrors
+        - pkg: k8s.io/apimachinery/pkg/util/errors
+          alias: kerrors
+        - pkg: k8s.io/component-base/logs/api/v1
+          alias: logsv1
+        # Controller Runtime
+        - pkg: sigs.k8s.io/controller-runtime
+          alias: ctrl
+        - pkg: k8s.io/apimachinery/pkg/util/runtime
+          alias: utilruntime
+        # CAPI core types: v1beta2 is the primary Go package post-CAPI 1.11.
+        - pkg: sigs.k8s.io/cluster-api/api/core/v1beta2
+          alias: clusterv1
+        - pkg: sigs.k8s.io/cluster-api/api/core/v1beta1
+          alias: clusterv1beta1
+        - pkg: sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2
+          alias: bootstrapv1
+        - pkg: sigs.k8s.io/cluster-api/api/controlplane/kubeadm/v1beta2
+          alias: controlplanev1
+        # CAPH API types: the latest version is infrav1, the same as clusterv1 for CAPI core. The deprecated v1beta1 version is infrav1beta1.
+        - pkg: github.com/syself/cluster-api-provider-hetzner/api/v1beta2
+          alias: infrav1
+        - pkg: github.com/syself/cluster-api-provider-hetzner/api/v1beta1
+          alias: infrav1beta1
+        # Deprecated v1beta1 patch + conditions helpers. Prefixed aliases prevent
+        # silent swaps with the non-deprecated util/patch and util/conditions packages
+        # (see CAPI 1.10->1.11 migration guide; wrong helper can drop conditions at
+        # runtime with no compile error).
+        - pkg: sigs.k8s.io/cluster-api/util/deprecated/v1beta1/patch
+          alias: v1beta1patch
+        - pkg: sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions
+          alias: v1beta1conditions
+        - pkg: sigs.k8s.io/cluster-api/util/deprecated/v1beta1/conditions/v1beta2
+          alias: v1beta2conditions
+        # Legacy-shadow conditions helper for v1beta2 CAPI core objects.
+        # Different package path than v1beta1conditions above — aliasing
+        # both distinctly avoids accidental swaps.
+        #
+        # Both helpers do the same thing (mark/read conditions) but look at
+        # different fields on the object:
+        #
+        # | Object                         | Old-style conditions field           | Helper                      |
+        # |--------------------------------|--------------------------------------|-----------------------------|
+        # | Our CRDs (HCloudMachine, etc.) | Status.Conditions                    | v1beta1conditions           |
+        # | CAPI core Machine/Cluster      | Status.Deprecated.V1Beta1.Conditions | deprecatedv1beta1conditions |
+        #
+        # CAPI moved its legacy conditions into a nested shadow to free up
+        # Status.Conditions for the new []metav1.Condition shape. Our CRDs
+        # haven't migrated yet, so they still use the top-level field.
+        - pkg: sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1
+          alias: deprecatedv1beta1conditions
+        - pkg: sigs.k8s.io/cluster-api/util/conditions
+          alias: conditions
+        - pkg: sigs.k8s.io/controller-runtime/pkg/metrics/server
+          alias: metricsserver
+        - pkg: sigs.k8s.io/controller-runtime/pkg/client/fake
+          alias: fakeclient
+      no-unaliased: true
+    nolintlint:
+      require-specific: true
+      allow-unused: false
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - revive
+        text: 'exported: exported method .*\.(Reconcile|SetupWithManager|SetupWebhookWithManager) should have comment or be unexported'
+      - linters:
+          - errcheck
+        text: Error return value of .((os\.)?std(out|err)\..*|.*Close|.*Flush|os\.Remove(All)?|.*print(f|ln)?|os\.(Un)?Setenv). is not checked
+      - linters:
+          - revive
+        text: exported (method|function|type|const) (.+) should have comment or be unexported
+        source: (func|type).*Fake.*
+      - linters:
+          - revive
+        path: fake_\.go
+        text: exported (method|function|type|const) (.+) should have comment or be unexported
+      - linters:
+          - revive
+        path: (framework|e2e)/.*.go
+        text: exported (method|function|type|const) (.+) should have comment or be unexported
+      - linters:
+          - revive
+        path: (e2e|infrastructure/hetzner)/.*.go
+        text: exported (method|function|type|const) (.+) should have comment or be unexported
+      - linters:
+          - unparam
+        text: always receives
+      - path: _test\.go
+        text: should not use dot imports
+      - path: (framework|e2e)/.*.go
+        text: should not use dot imports
+      - path: _test\.go
+        text: cyclomatic complexity
+      - linters:
+          - gocritic
+        text: 'appendAssign: append result not assigned to the same slice'
+      - linters:
+          - staticcheck
+        path: .*(api|types)\/.*\/conversion.*\.go$
+        text: 'SA1019: in.(.+) is deprecated'
+      - linters:
+          - staticcheck
+        path: pkg/services/baremetal/baremetal/baremetal.go
+        text: 'SA1019: .*FailureReason is deprecated'
+      # CAPI v1.11 deprecates the v1beta1 core types and the v1beta1 conditions/patch
+      # helper packages. We intentionally keep these imports while CAPH stays on the
+      # v1beta1 Cluster API contract (removed upstream tentatively Aug 2026). Suppress
+      # the per-import deprecation warnings so real SA1019 hits still surface.
+      # The conditions/v1beta2 subpath is the v1beta2 helper package designed for
+      # v1beta1-contract resources (HCloudMachine etc. store v1beta2 conditions in a
+      # separate field)
+      - linters:
+          - staticcheck
+        text: 'SA1019: "sigs\.k8s\.io/cluster-api/api/core/v1beta1" is deprecated'
+      - linters:
+          - staticcheck
+        text: 'SA1019: "sigs\.k8s\.io/cluster-api/util/deprecated/v1beta1/(patch|conditions(/v1beta2)?)" is deprecated'
+      # CAPI deprecated the v1beta1 condition typedefs (Condition, Conditions, ConditionType,
+      # ConditionSeverity) in core/v1beta2 when the v1beta2 condition list landed. We intentionally
+      # store deprecated v1beta1 conditions as these core/v1beta2 copies under
+      # status.deprecated.v1beta1.conditions, and test helpers assert against legacy-shadow conditions.
+      - linters:
+          - staticcheck
+        text: 'SA1019: clusterv1\.Condition(Type|Severity|s)? is deprecated'
+      # controller-runtime v0.23 deprecated mgr.GetEventRecorderFor in favor of GetEventRecorder.
+      # CAPI has not migrated to the new Events API yet, so we intentionally keep
+      # using the deprecated mgr.GetEventRecorderFor until CAPI adopts the new API.
+      - linters:
+          - staticcheck
+        text: 'SA1019: mgr\.GetEventRecorderFor is deprecated'
+      - linters:
+          - revive
+        path: .*(api|types|test)\/.*\/conversion.*\.go$
+        text: exported (method|function|type|const) (.+) should have comment or be unexported
+      - linters:
+          - revive
+        path: .*(api|types|test)\/.*\/conversion.*\.go$
+        text: 'var-naming: don''t use underscores in Go names;'
+      - linters:
+          - revive
+        path: .*(api|types)\/.*\/conversion.*\.go$
+        text: 'receiver-naming: receiver name'
+      - linters:
+          - staticcheck
+        path: .*(api|types|test)\/.*\/conversion.*\.go$
+        text: 'ST1003: should not use underscores in Go names;'
+      - linters:
+          - staticcheck
+        path: .*(api|types)\/.*\/conversion.*\.go$
+        text: 'ST1016: methods on the same type should have the same receiver name'
+      - linters:
+          - gocritic
+        path: _test\.go
+        text: 'deferInLoop: Possible resource leak, ''defer'' is called in the ''for'' loop'
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/syself/cluster-api-provider-hetzner)
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -1,0 +1,113 @@
+name: Verify Pull Request
+on: # yamllint disable-line rule:truthy
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+# yamllint disable rule:line-length
+jobs:
+  pr-verify:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/syself/caph-builder:1.0.31
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.github_token }}
+    name: Verify Pull Request
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fix Env Var HOME
+        uses: ./.github/actions/fixes
+        # Fixes:
+        #   fatal: detected dubious ownership in repository at '/__w/clu...
+        #   To add an exception for this directory, call:
+        #   git config --global --add safe.directory /__w...
+
+      # Take from https://github.com/kubernetes-sigs/kubebuilder/blob/master/.github/workflows/verify.yml
+      - name: Validate PR Title Format
+        shell: bash
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ -z "$TITLE" ]]; then
+            echo "Error: PR title cannot be empty."
+            exit 1
+          fi
+
+          if ! [[ "$TITLE" =~ ^(⚠|:warning:|✨|:sparkles:|🐛|:bug:|📖|:book:|🚀|:release:|🌱|:seedling:) ]]; then
+              echo "Error: Invalid PR title format."
+              echo "Your PR title must start with one of the following indicators:"
+              echo "- Breaking change: ⚠ or :warning:"
+              echo "- Non-breaking feature: ✨ or :sparkles:"
+              echo "- Patch fix: 🐛 or :bug:"
+              echo "- Docs: 📖 or :book:"
+              echo "- Release: 🚀 or :release:"
+              echo "- Infra/Tests/Other: 🌱 (U+1F331) or :seedling:"
+          fi
+
+          echo "PR title is valid: '$TITLE'"
+
+      - name: Verify Boilerplate
+        run: make verify-boilerplate
+
+      - name: Verify Shellcheck
+        run: make verify-shellcheck
+
+      - name: Verify CAPI Version
+        run: make verify-capi-version
+
+      - name: Verify Starlark
+        run: make verify-starlark
+
+      - name: Verify Generated Files of Git Repo
+        env:
+          # Use dummy data.
+          HETZNER_ROBOT_USER: ${{ secrets.HETZNER_ROBOT_USER || 'robot' }}
+          HETZNER_ROBOT_PASSWORD: ${{ secrets.HETZNER_ROBOT_PASSWORD || 'password' }}
+          HETZNER_SSH_PUB: ${{ secrets.HETZNER_SSH_PUB || 'c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUZha2VQdWJsaWNLZXlGb3JDSU9ubHkgdXNlckBjaQ==' }}
+          HETZNER_SSH_PRIV: ${{ secrets.HETZNER_SSH_PRIV || 'LS0tLS1CRUdJTiBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0KZmFrZQotLS0tLUVORCBPUEVOU1NIIFBSSVZBVEUgS0VZLS0tLS0K' }}
+          SSH_KEY_NAME: ${{ secrets.SSH_KEY_NAME || 'ci-key' }}
+        run: make verify-generated-files
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+      - name: Install renovate
+        run: npm i -g renovate@35.54.0 # TODO update this via renovatebot
+
+      - name: Validate config
+        shell: bash
+        run: |
+          for file in $(find . -name "*.json5"); do
+            renovate-config-validator ${file}
+          done
+
+      - name: Generate Size
+        if: github.event.pull_request.head.repo.full_name == github.repository # Skip forked PRs
+        uses: pascalgn/size-label-action@56b489b027932ec0cf60438a1a5f1a19c8fc71ff # v0.5.7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          sizes: >
+            {
+            "0": "XS",
+            "20": "S",
+            "50": "M",
+            "200": "L",
+            "800": "XL",
+            "2000": "XXL"
+            }
+      - name: Generate Labels
+        if: github.event.pull_request.head.repo.full_name == github.repository # Skip forked PRs
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7
+        with:
+          configuration-path: .github/labeler.yaml
+      - name: Sync Labels
+        if: github.event.pull_request.head.repo.full_name == github.repository # Skip forked PRs
+        uses: EndBug/label-sync@52074158190acb45f3077f9099fea818aa43f97a # v2
+        with:
+          config-file: .github/labels.yaml

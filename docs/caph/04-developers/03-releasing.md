@@ -1,0 +1,80 @@
+---
+title: Release Process
+description: Documentation on the CAPH release process, describing the necessary steps and how to version.
+metatitle: Cluster API Provider Hetzner Release Process
+---
+
+## Create a tag
+
+<Steps>
+
+<Step>Create an annotated tag</Step>
+
+- `git switch main`
+- `git pull`
+- Have a look at the current (old) version: [Github Releases](https://github.com/syself/cluster-api-provider-hetzner/releases)
+- `export RELEASE_TAG=<the tag of the release to be cut>` (eg. `export RELEASE_TAG=v1.0.1`)
+- `git tag -a ${RELEASE_TAG} -m ${RELEASE_TAG}`
+
+<Step>Push the tag to the GitHub repository</Step>
+
+> [!NOTE]
+> `origin` should be the name of the remote pointing to `github.com/syself/cluster-api-provider-hetzner`
+
+- `git push origin ${RELEASE_TAG}`
+- This will automatically trigger a [Github Action](https://github.com/syself/cluster-api-provider-hetzner/actions) to create a draft release (this will take roughly 6 minutes).
+
+</Steps>
+
+## Release in GitHub
+
+<Steps>
+
+<Step>Review the draft release</Step>
+
+Review the draft release on GitHub: [Releases](https://github.com/syself/cluster-api-provider-hetzner/releases). Use the pencil-icon to edit the draft release. Then use the button "Generate release notes". Pay close attention to the `## :question: Sort these by hand` section, as it contains items that need to be manually sorted. Feel free to move less important PRs, like version upgrades (from renovate bot), to the bottom.
+
+<Step>Check the generated assets</Step>
+
+Double check that the assets got created. There should be one zip file, one tgz file, and 12 yaml files.
+
+<Step>Mark as pre-release if applicable</Step>
+
+If it is pre-release, activate the corresponding check at the bottom of the page. And add `:rotating_light: This is a RELEASE CANDIDATE. If you find any bugs, file an [issue](https://github.com/syself/cluster-api-provider-hetzner/issues/new).` at the top of the release notes.
+
+<Step>Verify the container image</Step>
+
+Before publishing you can check the [Recent tagged image versions](https://github.com/syself/cluster-api-provider-hetzner/pkgs/container/caph): "latest" should be some seconds old and the new version number.
+
+<Step>Publish the release</Step>
+
+<Step>Announce the release</Step>
+
+Write to the corresponding channels: "FYI: .... was released, (add hyperlink). A big "thank you" to all contributors!"
+
+</Steps>
+
+Done 🥳
+
+## Manual creation of images
+
+This is only needed if you want to manually release images.
+
+<Steps>
+
+<Step>Login to ghcr</Step>
+
+<Step>Execute `make release-image`</Step>
+
+</Steps>
+
+## Versioning
+
+See the [versioning documentation](https://github.com/syself/cluster-api-provider-hetzner/blob/main/CONTRIBUTING.md#versioning) for more information.
+
+## Permissions
+
+Releasing requires a particular set of permissions.
+
+- Tag push access to the GitHub repository
+- GitHub Release creation access

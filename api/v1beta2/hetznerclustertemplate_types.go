@@ -1,0 +1,71 @@
+/*
+Copyright 2021 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1beta2
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+)
+
+// HetznerClusterTemplateSpec defines the desired state of HetznerClusterTemplate.
+type HetznerClusterTemplateSpec struct {
+	// template defines the desired state of HetznerClusterTemplate.
+	// +required
+	Template HetznerClusterTemplateResource `json:"template,omitempty,omitzero"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:path=hetznerclustertemplates,scope=Namespaced,categories=cluster-api,shortName=hcclt
+// +k8s:defaulter-gen=true
+
+// HetznerClusterTemplate is the Schema for the hetznerclustertemplates API.
+type HetznerClusterTemplate struct {
+	metav1.TypeMeta `json:",inline"`
+	// metadata is the standard object's metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// spec is the desired state of HetznerClusterTemplate.
+	// +optional
+	Spec HetznerClusterTemplateSpec `json:"spec,omitempty,omitzero"`
+}
+
+//+kubebuilder:object:root=true
+
+// HetznerClusterTemplateList contains a list of HetznerClusterTemplate.
+type HetznerClusterTemplateList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []HetznerClusterTemplate `json:"items"`
+}
+
+func init() {
+	objectTypes = append(objectTypes, &HetznerClusterTemplate{}, &HetznerClusterTemplateList{})
+}
+
+// HetznerClusterTemplateResource contains spec for HetznerClusterSpec.
+type HetznerClusterTemplateResource struct {
+	// metadata is the standard object's metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+	// +optional
+	ObjectMeta clusterv1.ObjectMeta `json:"metadata,omitempty,omitzero"`
+
+	// spec is the specification of the desired behavior of the HetznerCluster.
+	// +required
+	Spec HetznerClusterSpec `json:"spec,omitempty,omitzero"`
+}

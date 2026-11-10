@@ -1,0 +1,103 @@
+name: "E2E Test"
+description: "Runs the e2e test"
+inputs:
+  e2e_name:
+    description: "e2e_name"
+    required: true
+  e2e_make_target:
+    description: "e2e_make_target"
+    required: true
+  e2e_robot_user:
+    description: "e2e_robot_user"
+    required: false
+  e2e_robot_password:
+    description: "e2e_robot_password"
+    required: false
+  e2e_ssh_pub:
+    description: "e2e_ssh_pub"
+    required: true
+  e2e_ssh_priv:
+    description: "e2e_ssh_priv"
+    required: true
+  e2e_ssh_key_name:
+    description: "e2e_ssh_key_name"
+    required: true
+  tps_token:
+    description: "TPS token for fetching HCLOUD_TOKEN"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: "go.mod"
+
+    - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: hack/tools/bin
+        key: ${{ runner.os }}-tools-bin-e2e-${{ hashFiles('Makefile') }}
+        restore-keys: |
+          ${{ runner.os }}-tools-bin-e2e-
+          ${{ runner.os }}-tools-bin-
+
+    - name: Download artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        name: test-release
+        path: out
+
+    - name: Install hcloud
+      shell: bash
+      env:
+        hcloudctl_version: v1.52.0
+      run: |
+        curl -fsSL https://github.com/hetznercloud/cli/releases/download/${{ env.hcloudctl_version }}/hcloud-linux-amd64.tar.gz | tar -xzv hcloud
+        mkdir -p hack/tools/bin/
+        mv hcloud hack/tools/bin/hcloud
+
+    - name: Generate metadata
+      id: meta
+      uses: ./.github/actions/metadata
+      with:
+        metadata_flavor: ${{ env.metadata_flavor }}
+        metadata_tags: ${{ env.metadata_tags }}
+
+    - name: Prepull the pre-built image
+      shell: bash
+      run: docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${CAPH_CONTAINER_TAG}
+      env:
+        CAPH_CONTAINER_TAG: ${{ steps.meta.outputs.version }}
+
+    - name: Get HCLOUD_TOKEN # sets env.HCLOUD_TOKEN
+      shell: bash
+      env:
+        TPS_TOKEN: ${{ inputs.tps_token }}
+      run: hack/ci-e2e-get-token.sh
+
+    - name: "e2e-${{ inputs.e2e_name }}"
+      shell: bash
+      env:
+        CI: "true"
+        REGISTRY: ${{ env.REGISTRY }}
+        IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        CAPH_CONTAINER_TAG: ${{ steps.meta.outputs.version }}
+        HCLOUD_TOKEN: ${{ env.HCLOUD_TOKEN }}
+        HETZNER_ROBOT_USER: ${{ inputs.e2e_robot_user }}
+        HETZNER_ROBOT_PASSWORD: ${{ inputs.e2e_robot_password }}
+        HETZNER_SSH_PUB: ${{ inputs.e2e_ssh_pub }}
+        HETZNER_SSH_PRIV: ${{ inputs.e2e_ssh_priv }}
+        SSH_KEY_NAME: ${{ inputs.e2e_ssh_key_name }}
+        HCLOUD_WORKER_MACHINE_TYPE: cpx32
+        HCLOUD_CONTROL_PLANE_MACHINE_TYPE: cpx32
+        HCLOUD_REGION: hel1
+        SKIP_IMAGE_BUILD: "1"
+        CAPH_LATEST_VERSION: "v1.0.12"
+        BAREMETAL_POOL: ci-pool
+      run: make ${{ inputs.e2e_make_target }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      if: ${{ !cancelled() }}
+      with:
+        name: e2e-${{ inputs.e2e_name }}
+        path: _artifacts

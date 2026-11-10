@@ -1,0 +1,268 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package network implements the lifecycle of HCloud networks.
+package network
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"slices"
+
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	conditions "sigs.k8s.io/cluster-api/util/conditions"
+	deprecatedv1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+
+	infrav1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta2"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/scope"
+	hcloudutil "github.com/syself/cluster-api-provider-hetzner/pkg/services/hcloud/util"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/utils"
+)
+
+// Service struct contains cluster scope to reconcile networks.
+type Service struct {
+	scope *scope.ClusterScope
+}
+
+// NewService creates a new service object.
+func NewService(scope *scope.ClusterScope) *Service {
+	return &Service{
+		scope: scope,
+	}
+}
+
+// Reconcile implements life cycle of networks.
+func (s *Service) Reconcile(ctx context.Context) (err error) {
+	if !ptr.Deref(s.scope.HetznerCluster.Spec.HCloudNetwork.Enabled, false) {
+		return nil
+	}
+
+	defer func() {
+		if err != nil {
+			deprecatedv1beta1conditions.MarkFalse(
+				s.scope.HetznerCluster,
+				infrav1.NetworkReadyV1Beta1Condition,
+				infrav1.NetworkReconcileFailedV1Beta1Reason,
+				clusterv1.ConditionSeverityWarning,
+				"%s",
+				err.Error(),
+			)
+
+			conditions.Set(s.scope.HetznerCluster, metav1.Condition{
+				Type:    infrav1.HetznerClusterNetworkReadyCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.HetznerClusterNetworkReconcilingFailedReason,
+				Message: err.Error(),
+			})
+		}
+	}()
+
+	network, err := s.findNetwork(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to find network: %w", err)
+	}
+
+	if network == nil {
+		network, err = s.createNetwork(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to create network: %w", err)
+		}
+	}
+
+	deprecatedv1beta1conditions.MarkTrue(s.scope.HetznerCluster, infrav1.NetworkReadyV1Beta1Condition)
+
+	conditions.Set(s.scope.HetznerCluster, metav1.Condition{
+		Type:   infrav1.HetznerClusterNetworkReadyCondition,
+		Status: metav1.ConditionTrue,
+		Reason: string(infrav1.HetznerClusterNetworkReadyReason),
+	})
+
+	s.scope.HetznerCluster.Status.Network = statusFromHCloudNetwork(network)
+
+	return nil
+}
+
+func (s *Service) createNetwork(ctx context.Context) (*hcloud.Network, error) {
+	opts, err := s.createOpts()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NetworkCreateOpts: %w", err)
+	}
+
+	resp, err := s.scope.HCloudClient.CreateNetwork(ctx, opts)
+	if err != nil {
+		hcloudutil.HandleRateLimitExceeded(s.scope.HetznerCluster, s.scope.EventRecorder, err, "CreateNetwork")
+		s.scope.EventRecorder.Eventf(
+			s.scope.HetznerCluster,
+			corev1.EventTypeWarning,
+			"NetworkCreatedFailed",
+			"Failed to create network with opts %s",
+			opts,
+		)
+		return nil, fmt.Errorf("failed to create network: %w", err)
+	}
+
+	s.scope.EventRecorder.Eventf(
+		s.scope.HetznerCluster,
+		corev1.EventTypeNormal,
+		"NetworkCreated",
+		"Created network with opts %+v",
+		opts,
+	)
+	return resp, nil
+}
+
+func (s *Service) createOpts() (hcloud.NetworkCreateOpts, error) {
+	spec := s.scope.HetznerCluster.Spec.HCloudNetwork
+
+	_, network, err := net.ParseCIDR(spec.CIDRBlock)
+	if err != nil {
+		return hcloud.NetworkCreateOpts{}, fmt.Errorf("invalid network %q: %w", spec.CIDRBlock, err)
+	}
+
+	_, subnet, err := net.ParseCIDR(spec.SubnetCIDRBlock)
+	if err != nil {
+		return hcloud.NetworkCreateOpts{}, fmt.Errorf("invalid network %q: %w", spec.SubnetCIDRBlock, err)
+	}
+
+	return hcloud.NetworkCreateOpts{
+		Name:    s.scope.HetznerCluster.Name,
+		IPRange: network,
+		Labels:  s.labels(),
+		Subnets: []hcloud.NetworkSubnet{
+			{
+				IPRange:     subnet,
+				NetworkZone: hcloud.NetworkZone(spec.NetworkZone),
+				Type:        hcloud.NetworkSubnetTypeCloud,
+			},
+		},
+	}, nil
+}
+
+// Delete implements deletion of the network.
+func (s *Service) Delete(ctx context.Context) error {
+	if s.scope.HetznerCluster.Status.Network == nil {
+		// nothing to delete
+		return nil
+	}
+
+	id := s.scope.HetznerCluster.Status.Network.ID
+
+	if err := s.scope.HCloudClient.DeleteNetwork(ctx, &hcloud.Network{ID: id}); err != nil {
+		hcloudutil.HandleRateLimitExceeded(s.scope.HetznerCluster, s.scope.EventRecorder, err, "DeleteNetwork")
+		// if resource has been deleted already then do nothing
+		if hcloud.IsError(err, hcloud.ErrorCodeNotFound) {
+			s.scope.V(1).Info("deleting network failed - not found", "id", id)
+			return nil
+		}
+		s.scope.EventRecorder.Eventf(
+			s.scope.HetznerCluster,
+			corev1.EventTypeWarning,
+			"NetworkDeleteFailed",
+			"Failed to delete network with ID %v",
+			id,
+		)
+		return fmt.Errorf("failed to delete network: %w", err)
+	}
+
+	s.scope.EventRecorder.Eventf(
+		s.scope.HetznerCluster,
+		corev1.EventTypeNormal,
+		"NetworkDeleted",
+		"Deleted network with ID %v",
+		id,
+	)
+	return nil
+}
+
+func (s *Service) findNetwork(ctx context.Context) (*hcloud.Network, error) {
+	opts := hcloud.NetworkListOpts{}
+	opts.LabelSelector = utils.LabelsToLabelSelector(s.labels())
+
+	networks, err := s.scope.HCloudClient.ListNetworks(ctx, opts)
+	if err != nil {
+		hcloudutil.HandleRateLimitExceeded(s.scope.HetznerCluster, s.scope.EventRecorder, err, "ListNetworks")
+		return nil, fmt.Errorf("failed to list networks: %w", err)
+	}
+
+	if len(networks) > 1 {
+		return nil, fmt.Errorf("found multiple networks with opts %v - not allowed", opts)
+	}
+
+	if len(networks) == 0 {
+		return nil, nil
+	}
+
+	if len(networks[0].Subnets) >= 1 {
+		// Allow existing subnets, but validate them
+
+		// When multiple subnets of type "cloud" are present,
+		// there currently is no guarantee that resources will be created in the correct subnet
+		// The current solution is to allow only one subnet of type "cloud" and any subnet of type "vswitch" (technically limited to 1 though)
+		// Official support for multiple "cloud" subnets can be added when using hcloud-go version >= 2.30.0
+		// where ServerAttachToNetworkOpts allows to specify an "IPRange"
+		// ref: https://pkg.go.dev/github.com/hetznercloud/hcloud-go/v2@v2.30.0/hcloud#ServerAttachToNetworkOpts
+
+		// Create a new slice with only "cloud" typed subnet
+		cloudSubnets := slices.Clone(networks[0].Subnets)
+		cloudSubnets = slices.DeleteFunc(cloudSubnets, func(s hcloud.NetworkSubnet) bool {
+			return s.Type == hcloud.NetworkSubnetTypeVSwitch
+		})
+
+		switch c := len(cloudSubnets); {
+		case c > 1:
+			return nil, fmt.Errorf("multiple subnet of type 'cloud' are currently not allowed")
+		case c == 0:
+			return nil, fmt.Errorf("a subnet of type 'cloud' is missing")
+		case c == 1:
+			configuredSubnet := s.scope.HetznerCluster.Spec.HCloudNetwork.SubnetCIDRBlock
+			gotSubnet := cloudSubnets[0].IPRange.String()
+
+			// Make sure the configured subnet CIDR matches the one available in the network
+			if gotSubnet != configuredSubnet {
+				return nil, fmt.Errorf("the subnet %s does not match the configured %s", gotSubnet, configuredSubnet)
+			}
+		}
+	}
+
+	return networks[0], nil
+}
+
+func statusFromHCloudNetwork(network *hcloud.Network) *infrav1.NetworkStatus {
+	attachedServerIDs := make([]int64, 0, len(network.Servers))
+	for _, s := range network.Servers {
+		attachedServerIDs = append(attachedServerIDs, s.ID)
+	}
+	// The server IDs are not sorted by the API, but we want to have a
+	// deterministic order to avoid unnecessary updates to the HetznerCluster resource.
+	slices.Sort(attachedServerIDs)
+
+	return &infrav1.NetworkStatus{
+		ID:              network.ID,
+		AttachedServers: attachedServerIDs,
+	}
+}
+
+func (s *Service) labels() map[string]string {
+	clusterTagKey := s.scope.HetznerCluster.ClusterTagKey()
+	return map[string]string{
+		clusterTagKey: string(infrav1.ResourceLifecycleOwned),
+	}
+}

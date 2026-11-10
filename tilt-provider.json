@@ -1,0 +1,16 @@
+{
+    "name": "hetzner",
+    "config": {
+      "image": "ghcr.io/syself/caph-staging",
+      "live_reload_deps": [
+        "main.go",
+        "go.mod",
+        "go.sum",
+        "api",
+        "pkg",
+        "controllers"
+      ],
+      "label": "CAPH",
+      "manager_name": "caph-controller-manager"
+    }
+  }

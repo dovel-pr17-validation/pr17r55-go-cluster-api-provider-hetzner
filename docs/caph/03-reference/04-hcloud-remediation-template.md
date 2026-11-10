@@ -1,0 +1,29 @@
+---
+title: HCloudRemediationTemplate
+description: HCloudRemediationTemplate defines remediation strategy, timeouts and retries.
+metatitle: HCloudRemediationTemplate Object Reference
+---
+
+## Overview of HCloudRemediationTemplate.Spec
+
+<PropField name="template.spec.strategy" type="object" required={false}>
+
+Strategy field defines remediation strategy.
+
+<Collapsible title="properties">
+
+<PropField name="template.spec.strategy.retryLimit" type="integer" required={false}>
+RetryLimit sets the maximum number of remediation retries. Zero retries if not set.
+</PropField>
+
+<PropField name="template.spec.strategy.timeout" type="string" required={true}>
+Timeout sets the timeout between remediation retries. It should be of the form "10m", or "40s".
+</PropField>
+
+<PropField name="template.spec.strategy.type" type="string" defaultValue="Reboot" required={false}>
+Type represents the type of the remediation strategy. At the moment, only "Reboot" is supported.
+</PropField>
+
+</Collapsible>
+
+</PropField>

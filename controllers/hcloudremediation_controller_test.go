@@ -1,0 +1,626 @@
+/*
+Copyright 2023 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/hetznercloud/hcloud-go/v2/hcloud"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	conditions "sigs.k8s.io/cluster-api/util/conditions"
+	deprecatedv1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	infrav1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta2"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/scope"
+	hcloudutil "github.com/syself/cluster-api-provider-hetzner/pkg/services/hcloud/util"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/utils"
+)
+
+var _ = Describe("HCloudRemediationReconciler", func() {
+	var (
+		hcloudRemediation *infrav1.HCloudRemediation
+		hcloudMachine     *infrav1.HCloudMachine
+		hetznerCluster    *infrav1.HetznerCluster
+
+		capiMachine *clusterv1.Machine
+		capiCluster *clusterv1.Cluster
+
+		hetznerSecret   *corev1.Secret
+		bootstrapSecret *corev1.Secret
+
+		testNs *corev1.Namespace
+
+		hcloudRemediationkey client.ObjectKey
+		capiMachineKey       client.ObjectKey
+		hcloudMachineKey     client.ObjectKey
+	)
+
+	BeforeEach(func() {
+		var err error
+		var finish func()
+		testNs, finish, err = testEnv.ResetAndCreateNamespace(ctx, "hcloudmachinetemplate-reconciler")
+		defer finish()
+		Expect(err).NotTo(HaveOccurred())
+
+		hetznerSecret = getDefaultHetznerSecret(testNs.Name)
+		Expect(testEnv.Create(ctx, hetznerSecret)).To(Succeed())
+
+		bootstrapSecret = getDefaultBootstrapSecret(testNs.Name)
+		Expect(testEnv.Create(ctx, bootstrapSecret)).To(Succeed())
+
+		capiCluster = &clusterv1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "test1-",
+				Namespace:    testNs.Name,
+				Finalizers:   []string{clusterv1.ClusterFinalizer},
+			},
+			Spec: clusterv1.ClusterSpec{
+				InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: "infrastructure.cluster.x-k8s.io",
+					Kind:     "HetznerCluster",
+					Name:     "hetzner-test1",
+				},
+			},
+		}
+		Expect(testEnv.Create(ctx, capiCluster)).To(Succeed())
+
+		hcloudMachineName := utils.GenerateName(nil, "hcloud-machine-")
+		capiMachineName := utils.GenerateName(nil, "capi-machine-")
+
+		capiMachine = &clusterv1.Machine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       capiMachineName,
+				Namespace:  testNs.Name,
+				Finalizers: []string{clusterv1.MachineFinalizer},
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel: capiCluster.Name,
+				},
+			},
+			Spec: clusterv1.MachineSpec{
+				ClusterName: capiCluster.Name,
+				InfrastructureRef: clusterv1.ContractVersionedObjectReference{
+					APIGroup: "infrastructure.cluster.x-k8s.io",
+					Kind:     "HCloudMachine",
+					Name:     hcloudMachineName,
+				},
+				FailureDomain: defaultFailureDomain,
+				Bootstrap: clusterv1.Bootstrap{
+					DataSecretName: ptr.To("bootstrap-secret"),
+				},
+			},
+		}
+		Expect(testEnv.Create(ctx, capiMachine)).To(Succeed())
+
+		capiMachineKey = client.ObjectKey{Name: capiMachineName, Namespace: testNs.Name}
+
+		hetznerCluster = &infrav1.HetznerCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hetzner-test1",
+				Namespace: testNs.Name,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "Cluster",
+						Name:       capiCluster.Name,
+						UID:        capiCluster.UID,
+					},
+				},
+			},
+			Spec: getDefaultHetznerClusterSpec(),
+		}
+		Expect(testEnv.Create(ctx, hetznerCluster)).To(Succeed())
+
+		hcloudMachine = &infrav1.HCloudMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      hcloudMachineName,
+				Namespace: testNs.Name,
+				Labels: map[string]string{
+					clusterv1.ClusterNameLabel:             capiCluster.Name,
+					clusterv1.MachineControlPlaneNameLabel: "",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: clusterv1.GroupVersion.String(),
+						Kind:       "Machine",
+						Name:       capiMachine.Name,
+						UID:        capiMachine.UID,
+					},
+				},
+			},
+			Spec: infrav1.HCloudMachineSpec{
+				ImageName: "my-control-plane",
+				Type:      "cpx32",
+			},
+		}
+		Expect(testEnv.Create(ctx, hcloudMachine)).To(Succeed())
+
+		hcloudMachineKey = client.ObjectKey{Name: hcloudMachineName, Namespace: testNs.Name}
+
+		hcloudRemediation = &infrav1.HCloudRemediation{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hcloud-remediation",
+				Namespace: testNs.Name,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						Kind:       "Machine",
+						APIVersion: clusterv1.GroupVersion.String(),
+						Name:       capiMachine.Name,
+						UID:        capiMachine.UID,
+					},
+				},
+			},
+			Spec: infrav1.HCloudRemediationSpec{
+				Strategy: infrav1.RemediationStrategy{
+					Type:           "Reboot",
+					RetryLimit:     ptr.To(int32(1)),
+					TimeoutSeconds: ptr.To(int32(1)),
+				},
+			},
+		}
+
+		hcloudRemediationkey = client.ObjectKey{Namespace: testNs.Name, Name: "hcloud-remediation"}
+	})
+
+	AfterEach(func() {
+		Expect(testEnv.Cleanup(ctx, testNs, hcloudRemediation, hcloudMachine,
+			hetznerSecret, bootstrapSecret, hetznerCluster, capiMachine, capiCluster)).To(Succeed())
+	})
+
+	Context("Basic hcloudremediation test", func() {
+		It("creates the hcloudRemediation successfully", func() {
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			Eventually(func() error {
+				return testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation)
+			}, timeout).Should(BeNil())
+		})
+
+		It("checks if hcloudRemediation objects has the HCloudTokenAvailableCondition condition", func() {
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			Eventually(func() bool {
+				return isPresentAndTrueWithReason(hcloudRemediationkey, hcloudRemediation, infrav1.HCloudTokenAvailableCondition, infrav1.HCloudTokenAvailableReason) &&
+					isPresentAndTrueDeprecatedV1Beta1(hcloudRemediationkey, hcloudRemediation, infrav1.HCloudTokenAvailableV1Beta1Condition)
+			}, timeout).Should(BeTrue())
+		})
+
+		It("checks that no remediation is tried if HCloud server does not exist anymore", func() {
+			By("ensuring if hcloudMachine is provisioned")
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudMachineKey, hcloudMachine); err != nil {
+					return err
+				}
+
+				if !ptr.Deref(hcloudMachine.Status.Initialization.Provisioned, false) {
+					return fmt.Errorf("hcloudMachine.Status.Initialization.Provisioned is not true (yet)")
+				}
+				return nil
+			}, timeout).ShouldNot(HaveOccurred())
+
+			By("deleting the server associated with the hcloudMachine")
+			providerID, err := hcloudutil.ServerIDFromProviderID(&hcloudMachine.Spec.ProviderID)
+			Expect(err).NotTo(HaveOccurred())
+
+			hcloudClient := testEnv.HCloudClientFactory.NewClient("fake-token")
+			Expect(hcloudClient.DeleteServer(ctx, &hcloud.Server{ID: providerID})).NotTo(HaveOccurred())
+
+			By("creating the hcloudRemediation")
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			By("checking if hcloudRemediation is in deleting phase and capiMachine has the MachineOwnerRemediatedCondition")
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return err
+				}
+				if hcloudRemediation.Status.Phase != infrav1.PhaseDeleting {
+					return fmt.Errorf("hcloudRemediation.Status.Phase is not PhaseDeleting")
+				}
+				if !isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) {
+					return fmt.Errorf("MachineOwnerRemediatedCondition not set")
+				}
+				if !isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason) {
+					return fmt.Errorf("native MachineOwnerRemediatedCondition not set")
+				}
+				return nil
+			}, timeout).Should(Succeed())
+		})
+
+		It("checks that, under normal conditions, a reboot is carried out and retryCount and lastRemediated are set", func() {
+			// Wait until machine has a ProviderID
+			Eventually(func() error {
+				err := testEnv.Client.Get(ctx, hcloudMachineKey, hcloudMachine)
+				if err != nil {
+					return err
+				}
+				if hcloudMachine.Spec.ProviderID == "" {
+					return fmt.Errorf("hcloudMachine.Spec.ProviderID is still empty")
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateOperatingSystemRunning {
+					return fmt.Errorf("hcloudMachine.Status.BootState is not HCloudBootStateOperatingSystemRunning, but: %q", hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).NotTo(HaveOccurred())
+
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return err
+				}
+
+				if hcloudRemediation.Status.LastRemediated.IsZero() {
+					return fmt.Errorf("hcloudRemediation.Status.LastRemediated is zero")
+				}
+				if ptr.Deref(hcloudRemediation.Status.RetryCount, 0) != 1 {
+					return fmt.Errorf("hcloudRemediation.Status.RetryCount is %d", ptr.Deref(hcloudRemediation.Status.RetryCount, 0))
+				}
+				return nil
+			}, timeout).ShouldNot(HaveOccurred())
+		})
+
+		It("checks if PhaseWaiting is set when retryLimit is reached", func() {
+			// Wait until machine has a ProviderID
+			Eventually(func() error {
+				err := testEnv.Client.Get(ctx, hcloudMachineKey, hcloudMachine)
+				if err != nil {
+					return err
+				}
+				if hcloudMachine.Spec.ProviderID == "" {
+					return fmt.Errorf("hcloudMachine.Spec.ProviderID is still empty")
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateOperatingSystemRunning {
+					return fmt.Errorf("Expected HCloudBootStateOperatingSystemRunning, but: %q",
+						hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).NotTo(HaveOccurred())
+			hcloudRemediation.Status.RetryCount = ptr.To(ptr.Deref(hcloudRemediation.Spec.Strategy.RetryLimit, 0))
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return err
+				}
+				if hcloudRemediation.Status.Phase != infrav1.PhaseWaiting {
+					return fmt.Errorf("hcloudRemediation.Status.Phase != PhaseWaiting (phase is %q)", hcloudRemediation.Status.Phase)
+				}
+				return nil
+			}, timeout).ShouldNot(HaveOccurred())
+		})
+
+		It("should delete machine if retry limit reached and reboot timed out (hcloud)", func() {
+			By("creating hcloudRemediation")
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			By("updating the status to waiting and setting the last remediation to past")
+			hcloudRemediationPatchHelper, err := patch.NewHelper(hcloudRemediation, testEnv.GetClient())
+			Expect(err).NotTo(HaveOccurred())
+
+			hcloudRemediation.Status.Phase = infrav1.PhaseWaiting
+			hcloudRemediation.Status.LastRemediated = metav1.Time{Time: time.Now().Add(-2 * time.Second)}
+
+			Expect(hcloudRemediationPatchHelper.Patch(ctx, hcloudRemediation)).NotTo(HaveOccurred())
+
+			By("checking if hcloudRemediation is in deleting phase and capiMachine has MachineOwnerRemediatedCondition")
+			Eventually(func() bool {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return false
+				}
+
+				testEnv.GetLogger().Info("status of hcloudRemediation", "status", hcloudRemediation.Status.Phase)
+				return hcloudRemediation.Status.Phase == infrav1.PhaseDeleting &&
+					isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) &&
+					isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason)
+			}, timeout).Should(BeTrue())
+		})
+		It("does no reboot and deletes the machine when retryLimit is 0", func() {
+			By("waiting until the machine has a ProviderID and is running")
+			Eventually(func() error {
+				if err := testEnv.Client.Get(ctx, hcloudMachineKey, hcloudMachine); err != nil {
+					return err
+				}
+				if hcloudMachine.Spec.ProviderID == "" {
+					return fmt.Errorf("hcloudMachine.Spec.ProviderID is still empty")
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateOperatingSystemRunning {
+					return fmt.Errorf("hcloudMachine.Status.BootState is not HCloudBootStateOperatingSystemRunning, but: %q", hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).NotTo(HaveOccurred())
+
+			By("creating the hcloudRemediation with retryLimit 0")
+			hcloudRemediation.Spec.Strategy.RetryLimit = ptr.To(int32(0))
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			By("checking that no reboot happened and the machine is handed to CAPI for deletion")
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return err
+				}
+				if ptr.Deref(hcloudRemediation.Status.RetryCount, 0) != 0 {
+					return fmt.Errorf("expected RetryCount 0, got %d", ptr.Deref(hcloudRemediation.Status.RetryCount, 0))
+				}
+				if !hcloudRemediation.Status.LastRemediated.IsZero() {
+					return fmt.Errorf("expected LastRemediated to be zero")
+				}
+				if hcloudRemediation.Status.Phase != infrav1.PhaseDeleting {
+					return fmt.Errorf("expected Phase %q, got %q", infrav1.PhaseDeleting, hcloudRemediation.Status.Phase)
+				}
+				if !isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) {
+					return fmt.Errorf("MachineOwnerRemediatedCondition not set")
+				}
+				if !isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason) {
+					return fmt.Errorf("native MachineOwnerRemediatedCondition not set")
+				}
+				return nil
+			}, timeout).ShouldNot(HaveOccurred())
+		})
+
+		It("does no reboot and deletes the machine when the Node is missing", func() {
+			By("waiting until the machine has a ProviderID and is running")
+			Eventually(func() error {
+				if err := testEnv.Client.Get(ctx, hcloudMachineKey, hcloudMachine); err != nil {
+					return err
+				}
+				if hcloudMachine.Spec.ProviderID == "" {
+					return fmt.Errorf("hcloudMachine.Spec.ProviderID is still empty")
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateOperatingSystemRunning {
+					return fmt.Errorf("hcloudMachine.Status.BootState is not HCloudBootStateOperatingSystemRunning, but: %q", hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).NotTo(HaveOccurred())
+
+			By("setting the Node as deleted on capiMachine")
+			capiMachinePatchHelper, err := patch.NewHelper(capiMachine, testEnv.GetClient())
+			Expect(err).NotTo(HaveOccurred())
+			conditions.Set(capiMachine, metav1.Condition{
+				Type:    clusterv1.MachineHealthCheckSucceededCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  clusterv1.MachineHealthCheckNodeDeletedReason,
+				Message: "Node has been deleted",
+			})
+			Expect(capiMachinePatchHelper.Patch(ctx, capiMachine)).NotTo(HaveOccurred())
+
+			By("creating the hcloudRemediation")
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			By("checking that no reboot happened and the machine is handed to CAPI for deletion")
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return err
+				}
+				if ptr.Deref(hcloudRemediation.Status.RetryCount, 0) != 0 {
+					return fmt.Errorf("expected RetryCount 0, got %d", ptr.Deref(hcloudRemediation.Status.RetryCount, 0))
+				}
+				if !hcloudRemediation.Status.LastRemediated.IsZero() {
+					return fmt.Errorf("expected LastRemediated to be zero")
+				}
+				if hcloudRemediation.Status.Phase != infrav1.PhaseDeleting {
+					return fmt.Errorf("expected Phase %q, got %q", infrav1.PhaseDeleting, hcloudRemediation.Status.Phase)
+				}
+				if !isPresentAndFalseWithReasonDeprecatedV1Beta1(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition, clusterv1.WaitingForRemediationV1Beta1Reason) {
+					return fmt.Errorf("MachineOwnerRemediatedCondition not set")
+				}
+				if !isPresentAndFalseWithReason(capiMachineKey, capiMachine, clusterv1.MachineOwnerRemediatedCondition, clusterv1.MachineOwnerRemediatedWaitingForRemediationReason) {
+					return fmt.Errorf("v1beta2 MachineOwnerRemediatedCondition not set")
+				}
+				return nil
+			}, timeout).ShouldNot(HaveOccurred())
+		})
+
+		It("should set RemediationSkippedCondition when HCloudMachine has irrecoverable server creation failure", func() {
+			By("waiting for HCloudMachine to be fully provisioned")
+			Eventually(func() error {
+				if err := testEnv.Get(ctx, hcloudMachineKey, hcloudMachine); err != nil {
+					return err
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateOperatingSystemRunning {
+					return fmt.Errorf("expected BootState %q, got %q",
+						infrav1.HCloudBootStateOperatingSystemRunning, hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).Should(Succeed())
+
+			By("marking HCloudMachine with irrecoverable server creation failure condition")
+			patchHelper, err := patch.NewHelper(hcloudMachine, testEnv.GetClient())
+			Expect(err).NotTo(HaveOccurred())
+			conditions.Set(hcloudMachine, metav1.Condition{
+				Type:    infrav1.HCloudMachineServerCreatedCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.HCloudMachineServerCreationFailedIrrecoverablyReason,
+				Message: "server type cax31 not available in location fsn1: resource_unavailable",
+			})
+			Expect(patchHelper.Patch(ctx, hcloudMachine)).To(Succeed())
+
+			By("creating the HCloudRemediation")
+			Expect(testEnv.Create(ctx, hcloudRemediation)).To(Succeed())
+
+			By("checking that RemediationSkippedCondition is set with IrrecoverableServerCreateFailureReason")
+			Eventually(func() bool {
+				return isPresentAndFalseWithReasonDeprecatedV1Beta1(
+					hcloudRemediationkey,
+					hcloudRemediation,
+					infrav1.RemediationSkippedV1Beta1Condition,
+					infrav1.IrrecoverableServerCreateFailureV1Beta1Reason,
+				)
+			}, timeout).Should(BeTrue())
+
+			By("checking RemediationSkipped and Ready conditions are set")
+			expectedSkippedMsg := "Remediation skipped: HCloudMachine has an irrecoverable server creation error. Delete the Machine to trigger a new creation attempt. Error: server type cax31 not available in location fsn1: resource_unavailable"
+			Eventually(func() bool {
+				if err := testEnv.Get(ctx, hcloudRemediationkey, hcloudRemediation); err != nil {
+					return false
+				}
+				skipped := conditions.Get(hcloudRemediation, infrav1.HCloudRemediationSkippedCondition)
+				if skipped == nil ||
+					skipped.Status != metav1.ConditionTrue ||
+					skipped.Reason != infrav1.HCloudRemediationServerCreationFailedIrrecoverablyReason ||
+					skipped.Message != expectedSkippedMsg {
+					return false
+				}
+				ready := conditions.Get(hcloudRemediation, clusterv1.ReadyCondition)
+				return ready != nil &&
+					ready.Status == metav1.ConditionFalse &&
+					ready.Reason == clusterv1.NotReadyReason
+			}, timeout).Should(BeTrue())
+		})
+
+		It("should delete machine if SetErrorAndRemediate() was called", func() {
+			By("Creating Server")
+
+			hcloudClient := testEnv.HCloudClientFactory.NewClient("dummy-token")
+
+			result, err := hcloudClient.CreateServer(ctx, hcloud.ServerCreateOpts{
+				Name: "myserver",
+			})
+			Expect(err).ShouldNot(HaveOccurred())
+			server := result.Server
+
+			Eventually(func() error {
+				err := testEnv.Get(ctx, client.ObjectKeyFromObject(hcloudMachine), hcloudMachine)
+				if err != nil {
+					return err
+				}
+				providerID := hcloudutil.ProviderIDFromServerID(int(server.ID))
+				hcloudMachine.Spec.ProviderID = providerID
+				return testEnv.Update(ctx, hcloudMachine)
+			}, timeout).Should(Succeed())
+
+			By("Wait until HCloudMachine has reached a stable boot state")
+			Eventually(func() error {
+				err := testEnv.Get(ctx, client.ObjectKeyFromObject(hcloudMachine), hcloudMachine)
+				if err != nil {
+					return err
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateBootingToRealOS &&
+					hcloudMachine.Status.BootState != infrav1.HCloudBootStateOperatingSystemRunning {
+					return fmt.Errorf("expected stable boot state before remediation, got %q",
+						hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).Should(Succeed())
+
+			By("Call SetRemediateMachineAnnotationToDeleteMachine")
+			Eventually(func() error {
+				err = testEnv.Get(ctx, client.ObjectKeyFromObject(hcloudMachine), hcloudMachine)
+				if err != nil {
+					return err
+				}
+				machineScope := &scope.MachineScope{
+					Client:        testEnv,
+					Machine:       capiMachine,
+					HCloudMachine: hcloudMachine,
+					EventRecorder: record.NewFakeRecorder(10),
+				}
+				err = machineScope.SetRemediateMachineAnnotationToDeleteMachine(ctx, "test-of-set-error-and-remediate")
+				if err != nil {
+					return err
+				}
+				err = testEnv.Status().Update(ctx, hcloudMachine)
+				if err != nil {
+					return err
+				}
+				return nil
+			}, timeout).Should(Succeed())
+
+			By("Wait until HCloudBootStateProvisioningFailed is set.")
+			Eventually(func() error {
+				err := testEnv.Get(ctx, client.ObjectKeyFromObject(hcloudMachine), hcloudMachine)
+				if err != nil {
+					return err
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateProvisioningFailed {
+					return fmt.Errorf("BootState is not HCloudBootStateProvisioningFailed, but %q",
+						hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).Should(Succeed())
+
+			By("Do the job of CAPI: Create a HCloudRemediation")
+			rem := &infrav1.HCloudRemediation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      hcloudMachine.Name,
+					Namespace: hcloudMachine.Namespace,
+				},
+				Spec: infrav1.HCloudRemediationSpec{
+					Strategy: infrav1.RemediationStrategy{
+						Type:           infrav1.RemediationTypeReboot,
+						RetryLimit:     ptr.To(int32(5)),
+						TimeoutSeconds: ptr.To(int32(60)),
+					},
+				},
+			}
+
+			err = controllerutil.SetOwnerReference(capiMachine, rem, testEnv.GetScheme())
+			Expect(err).Should(Succeed())
+
+			Eventually(func() error {
+				err := testEnv.Get(ctx, client.ObjectKeyFromObject(hcloudMachine), hcloudMachine)
+				if err != nil {
+					return err
+				}
+				if hcloudMachine.Status.BootState != infrav1.HCloudBootStateProvisioningFailed {
+					return fmt.Errorf("Expected HCloudBootStateProvisioningFailed, got %q",
+						hcloudMachine.Status.BootState)
+				}
+				return nil
+			}, timeout).Should(Succeed())
+
+			err = testEnv.Create(ctx, rem)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			By("Wait until our remediation controller has set condition on capi machine")
+			Eventually(func() error {
+				err := testEnv.Get(ctx, client.ObjectKeyFromObject(capiMachine), capiMachine)
+				if err != nil {
+					return err
+				}
+
+				c := deprecatedv1beta1conditions.Get(capiMachine, clusterv1.MachineOwnerRemediatedV1Beta1Condition)
+				if c == nil {
+					return fmt.Errorf("not set: MachineOwnerRemediatedCondition")
+				}
+				if c.Status != corev1.ConditionFalse {
+					return fmt.Errorf("status not set yet")
+				}
+				if c.Message != "Remediation finished (machine will be deleted): exit remediation because infra machine is in BootState ProvisioningFailed (no need to try a reboot)" {
+					return fmt.Errorf("Message is not as expected: %q", c.Message)
+				}
+
+				cond := conditions.Get(capiMachine, clusterv1.MachineOwnerRemediatedCondition)
+				if cond == nil {
+					return fmt.Errorf("not set: v1beta2 MachineOwnerRemediatedCondition")
+				}
+				if cond.Status != metav1.ConditionFalse || cond.Reason != clusterv1.MachineOwnerRemediatedWaitingForRemediationReason {
+					return fmt.Errorf("v1beta2 MachineOwnerRemediatedCondition is not as expected: %s/%s", cond.Status, cond.Reason)
+				}
+				return nil
+			}, timeout).Should(Succeed())
+		})
+	})
+})

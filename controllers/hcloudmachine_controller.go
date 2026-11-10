@@ -1,0 +1,721 @@
+/*
+Copyright 2021 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
+	controlplanev1 "sigs.k8s.io/cluster-api/api/controlplane/kubeadm/v1beta2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/annotations"
+	conditions "sigs.k8s.io/cluster-api/util/conditions"
+	capilabels "sigs.k8s.io/cluster-api/util/labels"
+	"sigs.k8s.io/cluster-api/util/predicates"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	infrav1 "github.com/syself/cluster-api-provider-hetzner/api/v1beta2"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/scope"
+	secretutil "github.com/syself/cluster-api-provider-hetzner/pkg/secrets"
+	sshclient "github.com/syself/cluster-api-provider-hetzner/pkg/services/baremetal/client/ssh"
+	hcloudclient "github.com/syself/cluster-api-provider-hetzner/pkg/services/hcloud/client"
+	"github.com/syself/cluster-api-provider-hetzner/pkg/services/hcloud/server"
+)
+
+// HCloudMachineReconciler reconciles a HCloudMachine object.
+type HCloudMachineReconciler struct {
+	client.Client
+	RateLimitWaitTime   time.Duration
+	APIReader           client.Reader
+	HCloudClientFactory hcloudclient.Factory
+	SSHClientFactory    sshclient.Factory
+	WatchFilterValue    string
+	EventRecorder       record.EventRecorder
+
+	// Reconcile only this namespace. Only needed for testing
+	Namespace string
+
+	// ReconcileGate, when non-nil, is held as a read lock for the full duration of each Reconcile
+	// call. Between tests, the test setup holds it as a write lock while swapping mock clients.
+	// A write lock can only be acquired once all read lock holders (in-flight reconciles) finish,
+	// so mock clients are never swapped while a Reconcile is running.
+	ReconcileGate *sync.RWMutex
+}
+
+//+kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;update
+//+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status,verbs=get;list;watch
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hcloudmachines,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hcloudmachines/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=hcloudmachines/finalizers,verbs=update
+
+// Reconcile manages the lifecycle of an HCloud machine object.
+func (r *HCloudMachineReconciler) Reconcile(ctx context.Context, req reconcile.Request) (res reconcile.Result, reterr error) {
+	if r.ReconcileGate != nil {
+		r.ReconcileGate.RLock()
+		defer r.ReconcileGate.RUnlock()
+	}
+
+	log := ctrl.LoggerFrom(ctx)
+
+	if r.Namespace != "" && req.Namespace != r.Namespace {
+		// Just for testing, skip reconciling objects from finished tests.
+		return ctrl.Result{}, nil
+	}
+	skipReconciliation, err := shouldSkipReconciliationForNamespace(ctx, r.Client, req.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if skipReconciliation {
+		log.Info("Skipping reconciliation for namespace", "namespace", req.Namespace, "annotation", infrav1.SkipNamespaceAnnotation)
+		return ctrl.Result{}, nil
+	}
+
+	// Fetch the HCloudMachine instance.
+	hcloudMachine := &infrav1.HCloudMachine{}
+	err = r.Get(ctx, req.NamespacedName, hcloudMachine)
+	if err != nil {
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+
+	log = log.WithValues("HCloudMachine", klog.KObj(hcloudMachine))
+
+	// Fetch the CAPI Machine. It is nil if the owner reference is not set yet, or if
+	// the CAPI Machine does not exist anymore.
+	machine, err := util.GetOwnerMachine(ctx, r, hcloudMachine.ObjectMeta)
+	if client.IgnoreNotFound(err) != nil {
+		return reconcile.Result{}, err
+	}
+	if machine == nil {
+		if hcloudMachine.DeletionTimestamp.IsZero() {
+			log.Info("HCloudMachine has no owner CAPI Machine")
+			return reconcile.Result{}, nil
+		}
+		// Continue without the CAPI Machine, so that we delete the server and remove the
+		// finalizer.
+		log.Info("HCloudMachine has no owner CAPI Machine, continuing to delete it")
+	}
+
+	log = log.WithValues("Machine", klog.KObj(machine))
+
+	// Fetch the Cluster.
+	cluster, err := util.GetClusterFromMetadata(ctx, r, hcloudMachine.ObjectMeta)
+	if err != nil {
+		log.Info("HCloudMachine is missing cluster label or cluster does not exist")
+		return reconcile.Result{}, nil
+	}
+
+	if annotations.IsPaused(cluster, hcloudMachine) {
+		log.Info("HCloudMachine or linked Cluster is marked as paused. Won't reconcile")
+		return reconcile.Result{}, nil
+	}
+
+	log = log.WithValues("Cluster", klog.KObj(cluster))
+
+	hetznerCluster := &infrav1.HetznerCluster{}
+
+	hetznerClusterName := client.ObjectKey{
+		Namespace: hcloudMachine.Namespace,
+		Name:      cluster.Spec.InfrastructureRef.Name,
+	}
+	if err := r.Get(ctx, hetznerClusterName, hetznerCluster); err != nil {
+		log.Info("HetznerCluster is not available yet")
+		return reconcile.Result{}, nil
+	}
+
+	log = log.WithValues("HetznerCluster", klog.KObj(hetznerCluster))
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	// Create the scope.
+	secretManager := secretutil.NewSecretManager(log, r, r.APIReader)
+
+	hcloudToken, hetznerSecret, err := getAndValidateHCloudToken(ctx, req.Namespace, hetznerCluster, secretManager)
+	if err != nil {
+		// On the token-error early-return, hcloudTokenErrorResult does a full
+		// Status().Update. Set the deletion markers here so they are persisted
+		// (the scope's patchHelper is not created on this path).
+		if !hcloudMachine.DeletionTimestamp.IsZero() {
+			hcloudMachine.Status.InstanceState = infrav1.InstanceStateDeleting
+			conditions.Set(hcloudMachine, metav1.Condition{
+				Type:   infrav1.HCloudMachineServerAvailableCondition,
+				Status: metav1.ConditionFalse,
+				Reason: infrav1.HCloudMachineDeletingReason,
+			})
+		}
+		return hcloudTokenErrorResult(ctx, err, hcloudMachine, r, infrav1.HCloudMachineSummaryOpts())
+	}
+
+	hcc := r.HCloudClientFactory.NewClient(hcloudToken)
+
+	machineScope, err := scope.NewMachineScope(scope.MachineScopeParams{
+		Client:           r,
+		Logger:           log,
+		Cluster:          cluster,
+		HetznerCluster:   hetznerCluster,
+		HCloudClient:     hcc,
+		HetznerSecret:    hetznerSecret,
+		APIReader:        r.APIReader,
+		Machine:          machine,
+		HCloudMachine:    hcloudMachine,
+		SSHClientFactory: r.SSHClientFactory,
+		EventRecorder:    r.EventRecorder,
+	})
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to create scope: %+v", err)
+	}
+
+	initialHCloudMachine := hcloudMachine.DeepCopy()
+	startReconcile := time.Now()
+	// Always close the scope when exiting this function so we can persist any HCloudMachine changes.
+	defer func() {
+		// the Close() will use PatchHelper to store the changes.
+		if err := machineScope.Close(ctx); err != nil {
+			res = reconcile.Result{}
+			reterr = errors.Join(reterr, err)
+		}
+
+		if !cmp.Equal(initialHCloudMachine, hcloudMachine) {
+			// The hcloudMachine was changed. Wait until the local cache contains the revision
+			// which was created by above machineScope.Close().
+			// We want to read our own writes.
+			err := wait.PollUntilContextTimeout(ctx, 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (done bool, err error) {
+				// new resource, read from local cache
+				latest := &infrav1.HCloudMachine{}
+				getErr := r.Get(ctx, client.ObjectKeyFromObject(machineScope.HCloudMachine), latest)
+				if apierrors.IsNotFound(getErr) {
+					// the object was deleted. All is fine.
+					return true, nil
+				}
+				if getErr != nil {
+					return false, getErr
+				}
+				// When the ResourceVersion has changed, then it is very likely that the local
+				// cache has the new version.
+				return latest.ResourceVersion != hcloudMachine.ResourceVersion, nil
+			})
+			if err != nil {
+				log.Error(err, "cache sync failed after BootState change")
+			}
+		}
+
+		readyReason := conditions.GetReason(machineScope.HCloudMachine, clusterv1.ReadyCondition)
+		readyMessage := conditions.GetMessage(machineScope.HCloudMachine, clusterv1.ReadyCondition)
+
+		duration := time.Since(startReconcile)
+
+		if duration > 5*time.Second {
+			log.Info("Reconcile took too long",
+				"reconcileDuration", duration,
+				"res", res,
+				"reterr", reterr,
+				"oldState", initialHCloudMachine.Status.BootState,
+				"newState", machineScope.HCloudMachine.Status.BootState,
+				"readyReason", readyReason,
+				"readyMessage", readyMessage,
+			)
+		}
+
+		if initialHCloudMachine.Status.BootState != machineScope.HCloudMachine.Status.BootState {
+			startBootState := initialHCloudMachine.Status.BootStateSince
+			if startBootState.IsZero() {
+				startBootState = initialHCloudMachine.CreationTimestamp
+			}
+			log.Info("BootState changed",
+				"oldState", initialHCloudMachine.Status.BootState,
+				"newState", machineScope.HCloudMachine.Status.BootState,
+				"durationInState", machineScope.HCloudMachine.Status.BootStateSince.Time.Sub(startBootState.Time).Round(time.Second),
+				"readyReason", readyReason,
+				"readyMessage", readyMessage,
+			)
+		}
+	}()
+
+	// Check whether rate limit has been reached and if so, then wait.
+	if wait := reconcileRateLimit(hcloudMachine, r.RateLimitWaitTime); wait {
+		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	if !hcloudMachine.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, machineScope)
+	}
+
+	if hcloudMachine.Status.BootState == infrav1.HCloudBootStateProvisioningFailed {
+		// This hcloud machine will be removed soon.
+		log.Info("hcloudmachine: ProvisioningFailed. Not reconciling this machine.")
+		return reconcile.Result{}, nil
+	}
+
+	return r.reconcileNormal(ctx, machineScope)
+}
+
+func (r *HCloudMachineReconciler) reconcileDelete(ctx context.Context, machineScope *scope.MachineScope) (reconcile.Result, error) {
+	hcloudMachine := machineScope.HCloudMachine
+
+	// Delete servers.
+	result, err := server.NewService(machineScope).Delete(ctx)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to delete servers for HCloudMachine %s/%s: %w", hcloudMachine.Namespace, hcloudMachine.Name, err)
+	}
+	emptyResult := reconcile.Result{}
+	if result != emptyResult {
+		return result, nil
+	}
+	// Machine is deleted so remove the finalizer.
+	controllerutil.RemoveFinalizer(machineScope.HCloudMachine, infrav1.HCloudMachineFinalizer)
+
+	return reconcile.Result{}, nil
+}
+
+func (r *HCloudMachineReconciler) reconcileNormal(ctx context.Context, machineScope *scope.MachineScope) (reconcile.Result, error) {
+	hcloudMachine := machineScope.HCloudMachine
+
+	// If the HCloudMachine doesn't have our finalizer, add it.
+	controllerutil.AddFinalizer(machineScope.HCloudMachine, infrav1.HCloudMachineFinalizer)
+
+	// Register the finalizer immediately to avoid orphaning HCloud resources on delete.
+	if err := machineScope.PatchObject(ctx); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// reconcile server
+	result, err := server.NewService(machineScope).Reconcile(ctx)
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("failed to reconcile server for HCloudMachine %s/%s: %w",
+			hcloudMachine.Namespace, hcloudMachine.Name, err)
+	}
+
+	return result, nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *HCloudMachineReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	clusterToObjectFunc, err := util.ClusterToTypedObjectsMapper(r, &infrav1.HCloudMachineList{}, mgr.GetScheme())
+	if err != nil {
+		return fmt.Errorf("failed to create mapper for Cluster to HCloudMachines: %w", err)
+	}
+
+	err = ctrl.NewControllerManagedBy(mgr).
+		WithOptions(options).
+		For(&infrav1.HCloudMachine{}).
+		WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), log, r.WatchFilterValue)).
+		WithEventFilter(IgnoreInsignificantHCloudMachineStatusUpdates(log)).
+		Watches(
+			&clusterv1.Machine{},
+			handler.EnqueueRequestsFromMapFunc(util.MachineToInfrastructureMapFunc(infrav1.GroupVersion.WithKind("HCloudMachine"))),
+			builder.WithPredicates(IgnoreInsignificantMachineStatusUpdates(log)),
+		).
+		Watches(
+			&infrav1.HetznerCluster{},
+			handler.EnqueueRequestsFromMapFunc(r.HetznerClusterToHCloudMachines(ctx)),
+			builder.WithPredicates(IgnoreInsignificantHetznerClusterUpdates(log)),
+		).
+		Watches(
+			&clusterv1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(clusterToObjectFunc),
+			builder.WithPredicates(predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), log)),
+		).
+		// Watches runs the WithEventFilter predicates above on the Secret. When
+		// --watch-filter is set, one of these predicates rejects objects without the
+		// watch filter label. The Hetzner Secret does not have this label. Therefore,
+		// we use WatchesRawSource because it skips these predicates.
+		WatchesRawSource(source.Kind[client.Object](
+			mgr.GetCache(),
+			&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.SecretToHCloudMachines(ctx)),
+			IgnoreInsignificantSecretUpdates(log),
+		)).
+		Complete(r)
+	if err != nil {
+		return fmt.Errorf("error creating controller: %w", err)
+	}
+
+	r.EventRecorder = mgr.GetEventRecorderFor("hcloudmachine-controller")
+	return nil
+}
+
+// HetznerClusterToHCloudMachines is a handler.ToRequestsFunc to be used to enqueue requests for reconciliation
+// of HCloudMachines.
+func (r *HCloudMachineReconciler) HetznerClusterToHCloudMachines(_ context.Context) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		result := []reconcile.Request{}
+
+		log := log.FromContext(ctx)
+
+		c, ok := o.(*infrav1.HetznerCluster)
+		if !ok {
+			log.Error(fmt.Errorf("expected a HetznerCluster but got a %T", o), "failed to get HCloudMachine for HetznerCluster")
+			return nil
+		}
+
+		log = log.WithValues("objectMapper", "hetznerClusterToHCloudMachine", "namespace", c.Namespace, "hetznerCluster", c.Name)
+
+		// Don't handle deleted HetznerCluster
+		if !c.DeletionTimestamp.IsZero() {
+			return nil
+		}
+
+		cluster, err := util.GetOwnerCluster(ctx, r, c.ObjectMeta)
+		switch {
+		case apierrors.IsNotFound(err) || cluster == nil:
+			return result
+		case err != nil:
+			return result
+		}
+
+		labels := map[string]string{clusterv1.ClusterNameLabel: cluster.Name}
+		machineList := &clusterv1.MachineList{}
+		if err := r.List(ctx, machineList, client.InNamespace(c.Namespace), client.MatchingLabels(labels)); err != nil {
+			log.Error(err, "failed to list Machines, skipping mapping")
+			return nil
+		}
+		for _, m := range machineList.Items {
+			log = log.WithValues("machine", m.Name)
+			if m.Spec.InfrastructureRef.Kind != "HCloudMachine" {
+				continue
+			}
+			if m.Spec.InfrastructureRef.Name == "" {
+				continue
+			}
+			name := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.InfrastructureRef.Name}
+
+			result = append(result, reconcile.Request{NamespacedName: name})
+		}
+
+		return result
+	}
+}
+
+// machineAPIServerPodHealthyConditionChanged reports whether the Machine's
+// KubeadmControlPlaneMachineAPIServerPodHealthyCondition status changed. reconcileLoadBalancerAttachment
+// (pkg/services/hcloud/server/server.go) uses conditions.IsTrue on this condition to decide whether to
+// attach the server to the load balancer. Without this check, a condition change alone would not trigger
+// a reconcile.
+func machineAPIServerPodHealthyConditionChanged(oldMachine, newMachine *clusterv1.Machine) bool {
+	return conditions.IsTrue(oldMachine, controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyCondition) !=
+		conditions.IsTrue(newMachine, controlplanev1.KubeadmControlPlaneMachineAPIServerPodHealthyCondition)
+}
+
+// controlPlaneLoadBalancerTargetsChanged reports whether the load balancer's target list
+// changed. HCloudMachine reconciliation uses this list to decide whether a control-plane
+// server is already attached. Without this check, a target-list change alone would not
+// trigger a reconcile.
+func controlPlaneLoadBalancerTargetsChanged(oldCluster, newCluster *infrav1.HetznerCluster) bool {
+	var oldTargets []infrav1.LoadBalancerTarget
+	var newTargets []infrav1.LoadBalancerTarget
+
+	if oldCluster.Status.ControlPlaneLoadBalancer != nil {
+		oldTargets = oldCluster.Status.ControlPlaneLoadBalancer.Target
+	}
+
+	if newCluster.Status.ControlPlaneLoadBalancer != nil {
+		newTargets = newCluster.Status.ControlPlaneLoadBalancer.Target
+	}
+
+	return !slices.Equal(oldTargets, newTargets)
+}
+
+// SecretToHCloudMachines enqueues HCloudMachines when a Secret referenced by
+// HetznerCluster.Spec.HetznerSecret or SSHKeys.RescueSecretRef changes, e.g. token rotation.
+func (r *HCloudMachineReconciler) SecretToHCloudMachines(_ context.Context) handler.MapFunc {
+	return func(ctx context.Context, o client.Object) []reconcile.Request {
+		log := log.FromContext(ctx)
+
+		secret, ok := o.(*corev1.Secret)
+		if !ok {
+			log.Error(fmt.Errorf("expected a Secret but got a %T", o), "failed to get HCloudMachine for Secret")
+			return nil
+		}
+
+		log = log.WithValues("objectMapper", "secretToHCloudMachine", "namespace", secret.Namespace, "secret", secret.Name)
+
+		hetznerClusterList := &infrav1.HetznerClusterList{}
+		if err := r.List(ctx, hetznerClusterList, client.InNamespace(secret.Namespace)); err != nil {
+			log.Error(err, "failed to list HetznerClusters, skipping mapping")
+			return nil
+		}
+
+		result := []reconcile.Request{}
+		toRequests := r.HetznerClusterToHCloudMachines(ctx)
+		for i := range hetznerClusterList.Items {
+			hc := &hetznerClusterList.Items[i]
+			if hc.Spec.HetznerSecret.Name != secret.Name && ptr.Deref(hc.Spec.SSHKeys.RescueSecretRef, infrav1.SSHSecretRef{}).Name != secret.Name {
+				continue
+			}
+			// With --watch-filter set, this controller only needs to reconcile objects that have the
+			// watch filter label. The Secret watch does not check this label (see
+			// SetupWithManager). Therefore, we check the label of the HetznerCluster here.
+			if r.WatchFilterValue != "" && !capilabels.HasWatchLabel(hc, r.WatchFilterValue) {
+				continue
+			}
+			result = append(result, toRequests(ctx, hc)...)
+		}
+		return result
+	}
+}
+
+// IgnoreInsignificantSecretUpdates is a predicate that fires on updates only when the Secret's
+// Data actually changes, so controllers do not reconcile for ManagedFields or metadata-only
+// Secret updates.
+func IgnoreInsignificantSecretUpdates(logger logr.Logger) predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldSecret, ok := e.ObjectOld.(*corev1.Secret)
+			if !ok {
+				return false
+			}
+			newSecret, ok := e.ObjectNew.(*corev1.Secret)
+			if !ok {
+				return false
+			}
+			if reflect.DeepEqual(oldSecret.Data, newSecret.Data) {
+				return false
+			}
+			logger.V(1).Info("Secret data changed",
+				"namespace", newSecret.GetNamespace(), "name", newSecret.GetName())
+			return true
+		},
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+}
+
+// IgnoreInsignificantHetznerClusterUpdates is a predicate used for ignoring insignificant HetznerCluster.Status updates.
+func IgnoreInsignificantHetznerClusterUpdates(logger logr.Logger) predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			log := logger.WithValues(
+				"predicate", "IgnoreHetznerClusterConditionUpdates",
+				"type", "update",
+				"namespace", e.ObjectNew.GetNamespace(),
+				"kind", strings.ToLower(e.ObjectNew.GetObjectKind().GroupVersionKind().Kind),
+				"name", e.ObjectNew.GetName(),
+			)
+
+			var oldCluster, newCluster *infrav1.HetznerCluster
+			var ok bool
+			// This predicate only looks at HetznerCluster objects
+			if oldCluster, ok = e.ObjectOld.(*infrav1.HetznerCluster); !ok {
+				return true
+			}
+			if newCluster, ok = e.ObjectNew.(*infrav1.HetznerCluster); !ok {
+				// Something weird happened, and we received two different kinds of objects
+				return true
+			}
+
+			// We should not modify the original objects, this causes issues with code that relies on the original object.
+			oldCluster = oldCluster.DeepCopy()
+			newCluster = newCluster.DeepCopy()
+
+			// Set fields we do not care about to nil
+
+			oldCluster.ManagedFields = nil
+			newCluster.ManagedFields = nil
+
+			oldCluster.ResourceVersion = ""
+			newCluster.ResourceVersion = ""
+
+			if controlPlaneLoadBalancerTargetsChanged(oldCluster, newCluster) {
+				log.V(1).Info("HetznerCluster -> HCloudMachine event for control plane load balancer target change")
+				return true
+			}
+
+			oldCluster.Status.Conditions = nil
+			newCluster.Status.Conditions = nil
+
+			// The deprecated v1beta1 conditions are written alongside the native ones on every
+			// reconcile, so ignore them too when deciding whether an update is significant.
+			oldCluster.Status.Deprecated = nil
+			newCluster.Status.Deprecated = nil
+
+			if oldCluster.Status.ControlPlaneLoadBalancer != nil {
+				oldCluster.Status.ControlPlaneLoadBalancer.Target = nil
+			}
+			if newCluster.Status.ControlPlaneLoadBalancer != nil {
+				newCluster.Status.ControlPlaneLoadBalancer.Target = nil
+			}
+
+			oldCluster.Status.HCloudPlacementGroups = nil
+			newCluster.Status.HCloudPlacementGroups = nil
+
+			if oldCluster.Status.Network != nil {
+				oldCluster.Status.Network.AttachedServers = nil
+			}
+			if newCluster.Status.Network != nil {
+				newCluster.Status.Network.AttachedServers = nil
+			}
+
+			if reflect.DeepEqual(oldCluster, newCluster) {
+				// Only insignificant fields changed, no need to reconcile
+				return false
+			}
+			// There is a noteworthy diff, so we should reconcile
+			log.V(1).Info("Update to resource changes significant fields, will enqueue event")
+			return true
+		},
+		// We only care about Update events, anything else should be reconciled
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+	}
+}
+
+// IgnoreInsignificantMachineStatusUpdates is a predicate used for ignoring insignificant Machine.Status updates.
+func IgnoreInsignificantMachineStatusUpdates(logger logr.Logger) predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			log := logger.WithValues(
+				"predicate", "IgnoreInsignificantMachineStatusUpdates",
+				"type", "update",
+				"namespace", e.ObjectNew.GetNamespace(),
+				"kind", strings.ToLower(e.ObjectNew.GetObjectKind().GroupVersionKind().Kind),
+				"name", e.ObjectNew.GetName(),
+			)
+
+			var oldMachine, newMachine *clusterv1.Machine
+			var ok bool
+			// This predicate only looks at Machine objects
+			if oldMachine, ok = e.ObjectOld.(*clusterv1.Machine); !ok {
+				return true
+			}
+			if newMachine, ok = e.ObjectNew.(*clusterv1.Machine); !ok {
+				// Something weird happened, and we received two different kinds of objects
+				return true
+			}
+
+			// We should not modify the original objects, this causes issues with code that relies on the original object.
+			oldMachine = oldMachine.DeepCopy()
+			newMachine = newMachine.DeepCopy()
+
+			oldMachine.ManagedFields = nil
+			newMachine.ManagedFields = nil
+
+			oldMachine.ResourceVersion = ""
+			newMachine.ResourceVersion = ""
+
+			if machineAPIServerPodHealthyConditionChanged(oldMachine, newMachine) {
+				log.V(1).Info("Machine -> HCloudMachine event for load balancer related condition change")
+				return true
+			}
+
+			oldMachine.Status = clusterv1.MachineStatus{}
+			newMachine.Status = clusterv1.MachineStatus{}
+
+			if reflect.DeepEqual(oldMachine, newMachine) {
+				// Only insignificant fields changed, no need to reconcile
+				return false
+			}
+
+			log.V(1).Info("Machine -> HCloudMachine event")
+			return true
+		},
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+	}
+}
+
+// IgnoreInsignificantHCloudMachineStatusUpdates is a predicate used for ignoring insignificant HCloudMachine.Status updates.
+func IgnoreInsignificantHCloudMachineStatusUpdates(logger logr.Logger) predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			log := logger.WithValues(
+				"predicate", "IgnoreInsignificantHCloudMachineStatusUpdates",
+				"type", "update",
+				"namespace", e.ObjectNew.GetNamespace(),
+				"kind", strings.ToLower(e.ObjectNew.GetObjectKind().GroupVersionKind().Kind),
+				"name", e.ObjectNew.GetName(),
+			)
+
+			var oldHCloudMachine, newHCloudMachine *infrav1.HCloudMachine
+			var ok bool
+			// This predicate only looks at HCloudMachine objects
+			if oldHCloudMachine, ok = e.ObjectOld.(*infrav1.HCloudMachine); !ok {
+				return true
+			}
+			if newHCloudMachine, ok = e.ObjectNew.(*infrav1.HCloudMachine); !ok {
+				// Something weird happened, and we received two different kinds of objects
+				return true
+			}
+
+			// We should not modify the original objects, this causes issues with code that relies on the original object.
+			oldHCloudMachine = oldHCloudMachine.DeepCopy()
+			newHCloudMachine = newHCloudMachine.DeepCopy()
+
+			// check if status is empty - if so, it should be restored
+			emptyStatus := infrav1.HCloudMachineStatus{}
+			if reflect.DeepEqual(newHCloudMachine.Status, emptyStatus) {
+				return true
+			}
+
+			oldHCloudMachine.ManagedFields = nil
+			newHCloudMachine.ManagedFields = nil
+
+			oldHCloudMachine.ResourceVersion = ""
+			newHCloudMachine.ResourceVersion = ""
+
+			// The ProviderID is set by the controller. Do not react if that changes.
+			// Otherwise the next Reconcile is likely to read outdated data, because
+			// the Status was not updated yet. PatchHelper updates three times in this order:
+			// Status.Conditions, Resource, Status.
+			oldHCloudMachine.Spec.ProviderID = ""
+			newHCloudMachine.Spec.ProviderID = ""
+
+			oldHCloudMachine.Status = infrav1.HCloudMachineStatus{}
+			newHCloudMachine.Status = infrav1.HCloudMachineStatus{}
+
+			if reflect.DeepEqual(oldHCloudMachine, newHCloudMachine) {
+				// Only insignificant fields changed, no need to reconcile
+				return false
+			}
+
+			log.V(1).Info("HCloudMachine event")
+			return true
+		},
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+	}
+}
